@@ -1,0 +1,40 @@
+diff --git a/dlls/comctl32/treeview.c b/dlls/comctl32/treeview.c
+--- a/dlls/comctl32/treeview.c
++++ b/dlls/comctl32/treeview.c
+@@ -183,6 +183,7 @@
+ #define TREEVIEW_LEFT_MARGIN 8
+ 
+ #define MINIMUM_INDENT 19
++#define TREEVIEW_IMAGE_PADDING 3
+ 
+ #define CALLBACK_MASK_ALL (TVIF_TEXT|TVIF_CHILDREN|TVIF_IMAGE|TVIF_SELECTEDIMAGE)
+ 
+@@ -920,9 +921,14 @@
+     item->linesOffset = infoPtr->uIndent * (lar ? item->iLevel : item->iLevel - 1)
+ 	- infoPtr->scrollX;
+     item->stateOffset = item->linesOffset + infoPtr->uIndent;
++#if __WINE_COMCTL32_VERSION == 6
++    /* v6 reserves a leading margin even without an image list. */
++    item->stateOffset += TREEVIEW_IMAGE_PADDING;
++#endif
+     item->imageOffset = item->stateOffset
+ 	+ (STATEIMAGEINDEX(item->state) ? infoPtr->stateImageWidth : 0);
+     item->textOffset  = item->imageOffset + infoPtr->normalImageWidth;
++    if (infoPtr->normalImageWidth) item->textOffset += TREEVIEW_IMAGE_PADDING;
+ }
+ 
+ static VOID
+@@ -1870,10 +1876,10 @@
+             bRecalcVisible = TRUE;
+         }
+ 
+-        if (infoPtr->normalImageWidth > MINIMUM_INDENT &&
+-            infoPtr->normalImageWidth != infoPtr->uIndent)
++        if (infoPtr->normalImageWidth + TREEVIEW_IMAGE_PADDING > MINIMUM_INDENT &&
++            infoPtr->normalImageWidth + TREEVIEW_IMAGE_PADDING != infoPtr->uIndent)
+         {
+-            infoPtr->uIndent = infoPtr->normalImageWidth;
++            infoPtr->uIndent = infoPtr->normalImageWidth + TREEVIEW_IMAGE_PADDING;
+             bRecalcVisible = TRUE;
+         }
+ 

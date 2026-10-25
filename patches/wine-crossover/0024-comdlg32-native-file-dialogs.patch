@@ -1,0 +1,2039 @@
+From: MacSW maintainers
+Subject: [PATCH] comdlg32: Use the macOS file panels when MACSW_NATIVE_FILE_DIALOGS=1.
+
+With MACSW_NATIVE_FILE_DIALOGS=1, IFileDialog::Show (open, save, pick
+folders) and GetOpenFileName/GetSaveFileName (A and W) show NSOpenPanel or
+NSSavePanel through winemac.drv's macsw_file_dialog export (patch 0023).
+Unset or any other value but "all" keeps the Wine dialogs; so does any
+failure (no winemac.drv, no export, the panel did not start or did not
+report "started" within 10 s).
+
+- macdlg.c: the gate, JSON request writer, unix<->DOS path conversion
+  (wine_get_unix_file_name/wine_get_dos_file_name) and the modal loop: the
+  top-level owner is disabled like DialogBox does, the thread pumps its
+  messages with MsgWaitForMultipleObjectsEx while it polls the panel,
+  WM_QUIT is re-posted, and a destroyed owner cancels the panel. Afterwards
+  activation goes back to the owner if comdlg32 disabled it, otherwise to
+  the window that was active before, and the focus goes back too. A result
+  whose name Windows cannot spell ("q?x.txt") becomes the 8.3 name Wine
+  lists for the file.
+- itemdlg.c: the dialog state stays where the Wine dialog keeps it (folder,
+  selection, file type, the hidden custom control windows, results), so all
+  getters keep working. OnFolderChanging/OnFolderChange/OnTypeChange fire
+  at start like the Wine dialog; folder, selection and Format changes fire
+  them again; accessory controls fire OnCheckButtonToggled, OnItemSelected
+  and OnButtonClicked, and changes the application makes in its handlers are
+  sent back to the panel, as are SetFileTypeIndex, SetFolder and
+  SetFileName calls made at other times. Results become IShellItems; OnOverwrite is called
+  but the panel's own overwrite prompt is the only prompt (unless comdlg32
+  had to add the extension itself); OnFileOk returning S_FALSE shows the panel
+  again where the user was. IFileDialog::Close ends the panel; Show() on a
+  dialog whose panel is up returns E_UNEXPECTED.
+  The Wine dialog's window exists during a native Show(), hidden: made
+  from the same template (without WS_VISIBLE and without the shell browser)
+  before the first event and destroyed after OnFileOk, so
+  IOleWindow::GetWindow returns it from the first event on, and programs
+  that subclass it or put their own windows into it work as with the Wine
+  dialog, unseen. SOLIDWORKS's sldfileopen.dll builds its open options pane
+  in it and does not check GetWindow's result: with no window, File > Open
+  crashed (GetDlgItem on a NULL CWnd). Requests to show or activate it are
+  filtered (WM_WINDOWPOSCHANGING, WM_STYLECHANGING, and a check in the panel
+  loop); it never gets the focus and is never ended with EndDialog: IDCANCEL
+  sent to it, and Close(), end the panel. A program that asks for the window
+  in the events fired while the dialog opens gets the visible Wine dialog
+  instead (its handlers run again there), unless
+  MACSW_NATIVE_FILE_DIALOGS=all. The hidden window then stays, inert, until
+  Show() returns, because the program can keep state in it (SOLIDWORKS does
+  not build its pane again); so does a fallback after a panel that did not
+  start.
+- filedlg.c: OPENFILENAME dialogs with a hook or a custom template
+  (OFN_ENABLEHOOK with lpfnHook, OFN_ENABLETEMPLATE(HANDLE)) keep the Wine
+  dialog, because CDN_* notifications, CDM_* messages and child templates
+  need a real dialog window. So do open dialogs with OFN_CREATEPROMPT (and
+  IFileOpenDialog with FOS_CREATEPROMPT): they must accept names of files
+  that do not exist yet, which NSOpenPanel cannot. Otherwise the result is
+  filled like
+  FILEDLG95_OnOpen: lpstrFile (double-NUL list for OFN_ALLOWMULTISELECT,
+  with the items of the first item's folder only),
+  nFileOffset, nFileExtension, nFilterIndex, lpstrFileTitle, the default
+  extension (only with lpstrDefExt, only when the name has none),
+  OFN_EXTENSIONDIFFERENT, OFN_READONLY ("Open as read-only" box unless
+  OFN_HIDEREADONLY), FNERR_BUFFERTOOSMALL, the MRU entry and the current
+  directory (unless OFN_NOCHANGEDIR).
+
+diff --git a/dlls/comdlg32/Makefile.in b/dlls/comdlg32/Makefile.in
+index 4de12ae..89d60f3 100644
+--- a/dlls/comdlg32/Makefile.in
++++ b/dlls/comdlg32/Makefile.in
+@@ -18,6 +18,7 @@ SOURCES = \
+ 	finddlg.c \
+ 	fontdlg.c \
+ 	itemdlg.c \
++	macdlg.c \
+ 	pd32_collate.svg \
+ 	pd32_landscape.svg \
+ 	pd32_nocollate.svg \
+diff --git a/dlls/comdlg32/filedlg.c b/dlls/comdlg32/filedlg.c
+index df9b841..232439b 100644
+--- a/dlls/comdlg32/filedlg.c
++++ b/dlls/comdlg32/filedlg.c
+@@ -67,6 +67,7 @@
+ #include "shlobj.h"
+ #include "filedlgbrowser.h"
+ #include "shlwapi.h"
++#include "macdlg.h"
+ 
+ #include "wine/debug.h"
+ 
+@@ -527,6 +528,352 @@ static void init_filedlg_infoA(OPENFILENAMEA *ofn, FileOpenDlgInfos *info)
+     free(ofnW.lpstrFile);
+ }
+ 
++/***********************************************************************
++ *      MacSW native panel (macdlg.h)
++ *
++ * With MACSW_NATIVE_FILE_DIALOGS=1, GetOpenFileName and GetSaveFileName use
++ * NSOpenPanel/NSSavePanel. Hooks and custom templates need a real dialog
++ * window (CDN_* notifications, CDM_* messages, child dialogs), and an open
++ * dialog with OFN_CREATEPROMPT must accept names of files that do not exist
++ * yet, which NSOpenPanel cannot: those keep the Wine dialog, because
++ * correctness for the application comes first.
++ */
++#define NATIVE_READONLY_ID 0x7fff0001
++
++struct native_ofn
++{
++    BOOL done, ok, readonly;
++    UINT type;
++    UINT count;
++    WCHAR **paths;
++};
++
++static void native_ofn_line(void *context, int argc, char **argv)
++{
++    struct native_ofn *res = context;
++
++    if (!strcmp(argv[0], "type") && argc >= 2)
++        res->type = strtoul(argv[1], NULL, 10);
++    else if (!strcmp(argv[0], "check") && argc >= 3 && strtoul(argv[1], NULL, 10) == NATIVE_READONLY_ID)
++        res->readonly = atoi(argv[2]) != 0;
++    else if (!strcmp(argv[0], "path") && argc >= 2)
++    {
++        WCHAR *path = macdlg_dos_path(argv[1]), **paths;
++
++        if (path && (paths = realloc(res->paths, (res->count + 1) * sizeof(*paths))))
++        {
++            res->paths = paths;
++            if ((paths[res->count] = malloc((lstrlenW(path) + 1) * sizeof(WCHAR))))
++                lstrcpyW(paths[res->count++], path);
++        }
++        HeapFree(GetProcessHeap(), 0, path);
++    }
++    else if (!strcmp(argv[0], "result") && argc >= 2)
++    {
++        res->done = TRUE;
++        res->ok = !strcmp(argv[1], "ok");
++    }
++}
++
++/* Initial folder and name, in the order FILEDLG95_InitControls() uses. */
++static void native_ofn_start(FileOpenDlgInfos *info, WCHAR *dir, WCHAR *name)
++{
++    WCHAR buf[MAX_PATH], *part = NULL;
++
++    dir[0] = name[0] = 0;
++    if (info->filename && info->filename[0] && !wcspbrk(info->filename, L"*?"))
++    {
++        if (wcschr(info->filename, '\\') && GetFullPathNameW(info->filename, MAX_PATH, buf, &part))
++        {
++            if (part)
++            {
++                lstrcpynW(name, part, MAX_PATH);
++                *part = 0;
++            }
++            lstrcpynW(dir, buf, MAX_PATH);
++            return;
++        }
++        lstrcpynW(name, info->filename, MAX_PATH);
++    }
++    if (info->initdir && info->initdir[0] && GetFullPathNameW(info->initdir, MAX_PATH, buf, NULL) &&
++        PathFileExistsW(buf))
++    {
++        if (!PathIsDirectoryW(buf)) PathRemoveFileSpecW(buf);
++        lstrcpyW(dir, buf);
++        return;
++    }
++    buf[0] = 0;
++    FILEDLG95_MRU_load_filename(buf);
++    if (buf[0] && PathFileExistsW(buf))
++    {
++        if (!PathIsDirectoryW(buf)) PathRemoveFileSpecW(buf);
++        lstrcpyW(dir, buf);
++    }
++    /* Otherwise macOS opens the panel where the user last was. */
++}
++
++static const WCHAR *native_ofn_filter_spec(const WCHAR *filter, UINT index)
++{
++    while (filter && *filter)
++    {
++        const WCHAR *spec = filter + lstrlenW(filter) + 1;
++        if (!*spec) break;
++        if (!index--) return spec;
++        filter = spec + lstrlenW(spec) + 1;
++    }
++    return NULL;
++}
++
++static void native_ofn_request(FileOpenDlgInfos *info, BOOL save, struct macdlg_json *json)
++{
++    OPENFILENAMEW *ofn = info->ofnInfos;
++    WCHAR dir[MAX_PATH], name[MAX_PATH], title[64];
++    const WCHAR *filter;
++    UINT index = 0, count = 0;
++
++    native_ofn_start(info, dir, name);
++
++    macdlg_json_open(json, NULL, '{');
++    macdlg_json_utf8(json, "mode", save ? "save" : "open");
++    if (info->title)
++        macdlg_json_string(json, "title", info->title);
++    else if (save && LoadStringW(COMDLG32_hInstance, IDS_SAVE_AS, title, ARRAY_SIZE(title)))
++        macdlg_json_string(json, "title", title);
++    if (dir[0]) macdlg_json_folder(json, dir);
++    if (name[0]) macdlg_json_string(json, "fileName", name);
++    macdlg_json_open(json, "filters", '[');
++    for (filter = info->filter; filter && *filter; count++)
++    {
++        const WCHAR *spec = filter + lstrlenW(filter) + 1;
++        if (!*spec) break;
++        macdlg_json_filter(json, filter, spec);
++        filter = spec + lstrlenW(spec) + 1;
++    }
++    macdlg_json_close(json, ']');
++    if (ofn->nFilterIndex && ofn->nFilterIndex <= count) index = ofn->nFilterIndex - 1;
++    macdlg_json_int(json, "filterIndex", index);
++    macdlg_json_string(json, "defaultExt", info->defext);
++    /* Windows appends an extension only when lpstrDefExt is set. */
++    macdlg_json_bool(json, "appendExtension", info->defext != NULL);
++    macdlg_json_bool(json, "multiple", (ofn->Flags & OFN_ALLOWMULTISELECT) != 0);
++    macdlg_json_bool(json, "showHidden", (ofn->Flags & OFN_FORCESHOWHIDDEN) != 0);
++    macdlg_json_open(json, "controls", '[');
++    if (!save && !filedialog_is_readonly_hidden(info))
++    {
++        macdlg_json_open(json, NULL, '{');
++        macdlg_json_int(json, "id", NATIVE_READONLY_ID);
++        macdlg_json_utf8(json, "type", "check");
++        macdlg_json_utf8(json, "label", "Open as read-only");
++        macdlg_json_bool(json, "checked", (ofn->Flags & OFN_READONLY) != 0);
++        macdlg_json_close(json, '}');
++    }
++    macdlg_json_close(json, ']');
++    macdlg_json_test(json);
++    macdlg_json_close(json, '}');
++}
++
++/* Store a W result list (with its terminating NULs) in lpstrFile, W or A. */
++static BOOL native_ofn_store(FileOpenDlgInfos *info, const WCHAR *list, UINT len, UINT *offset_out)
++{
++    OPENFILENAMEW *ofn = info->ofnInfos;
++    UINT size = len;
++
++    if (!info->unicode)
++        size = WideCharToMultiByte(CP_ACP, 0, list, len, NULL, 0, NULL, NULL);
++    if (size > ofn->nMaxFile)
++    {
++        if (ofn->lpstrFile && ofn->nMaxFile >= 2) *(WORD *)ofn->lpstrFile = size;
++        COMDLG32_SetCommDlgExtendedError(FNERR_BUFFERTOOSMALL);
++        return FALSE;
++    }
++    if (!ofn->lpstrFile) return TRUE;
++    if (info->unicode)
++        memcpy(ofn->lpstrFile, list, len * sizeof(WCHAR));
++    else
++        WideCharToMultiByte(CP_ACP, 0, list, len, (char *)ofn->lpstrFile, ofn->nMaxFile, NULL, NULL);
++    if (offset_out && !info->unicode)
++        *offset_out = WideCharToMultiByte(CP_ACP, 0, list, *offset_out, NULL, 0, NULL, NULL);
++    return TRUE;
++}
++
++static BOOL native_ofn_result(FileOpenDlgInfos *info, BOOL save, struct native_ofn *res)
++{
++    OPENFILENAMEW *ofn = info->ofnInfos;
++    BOOL multi = (ofn->Flags & OFN_ALLOWMULTISELECT) != 0;
++    WCHAR *path = res->paths[0], *list, *ext, *p, dir[MAX_PATH];
++    UINT len, i, offset, ext_offset, dir_len = 0, prefix_len = 0, n;
++
++    if (info->filter && *info->filter) ofn->nFilterIndex = res->type + 1;
++    if (res->readonly) ofn->Flags |= OFN_READONLY;
++    else ofn->Flags &= ~OFN_READONLY;
++
++    if (res->count > 1 && multi)
++    {
++        /* One folder per list: items the panel found elsewhere (search results,
++           Recents) are left out, as the Windows dialog cannot pick them together. */
++        lstrcpynW(dir, path, MAX_PATH);
++        PathRemoveFileSpecW(dir);
++        dir_len = lstrlenW(dir);
++        prefix_len = dir_len && dir[dir_len - 1] == '\\' ? dir_len : dir_len + 1;   /* "C:\" or "C:\dir" */
++        for (i = n = 0; i < res->count; i++)
++        {
++            const WCHAR *item = res->paths[i];
++            if (!i || (!wcsnicmp(item, dir, dir_len) && (prefix_len == dir_len || item[dir_len] == '\\') &&
++                       item[prefix_len] && !wcschr(item + prefix_len, '\\')))
++                res->paths[n++] = res->paths[i];
++            else
++                free(res->paths[i]);
++        }
++        res->count = n;
++    }
++
++    if (res->count > 1 && multi)
++    {
++        /* "dir\0name1\0name2\0\0" like FILEDLG95_OnOpenMultipleFiles() */
++        len = dir_len + 2;
++        for (i = 0; i < res->count; i++) len += lstrlenW(res->paths[i] + prefix_len) + 1;
++        if (!(list = malloc(len * sizeof(WCHAR)))) return FALSE;
++        lstrcpyW(list, dir);
++        p = list + dir_len + 1;
++        for (i = 0; i < res->count; i++)
++        {
++            lstrcpyW(p, res->paths[i] + prefix_len);
++            p += lstrlenW(p) + 1;
++        }
++        *p++ = 0;
++        offset = dir_len + 1;
++        if (!native_ofn_store(info, list, p - list, &offset))
++        {
++            free(list);
++            return FALSE;
++        }
++        ofn->nFileOffset = offset;
++        ofn->nFileExtension = 0;
++        free(list);
++    }
++    else
++    {
++        /* Extension and flags as in FILEDLG95_OnOpen(ONOPEN_OPEN). */
++        len = lstrlenW(path);
++        if (!(list = malloc((len + MAX_PATH + 3) * sizeof(WCHAR)))) return FALSE;
++        lstrcpyW(list, path);
++        ext = PathFindExtensionW(list);
++        if (!*ext && info->defext)
++        {
++            const WCHAR *spec = native_ofn_filter_spec(info->filter, res->type);
++            WCHAR buf[MAX_PATH], *dot = NULL, *end;
++
++            buf[0] = 0;
++            if (spec)
++            {
++                lstrcpynW(buf, spec, MAX_PATH);
++                if ((end = wcschr(buf, ';'))) *end = 0;
++                if (!(dot = wcschr(buf, '.')) || wcspbrk(dot + 1, L"*?")) buf[0] = 0;
++                else memmove(buf, dot + 1, (lstrlenW(dot + 1) + 1) * sizeof(WCHAR));
++            }
++            if (!buf[0]) lstrcpynW(buf, info->defext, MAX_PATH);
++            if (buf[0])
++            {
++                lstrcatW(list, L".");
++                lstrcatW(list, buf);
++            }
++            /* In an open dialog an existing file without the extension wins. */
++            if (!save && !PathFileExistsW(list)) list[len] = 0;
++        }
++        ext = PathFindExtensionW(list);
++        if (info->defext)
++        {
++            if (!lstrcmpiW(info->defext, *ext ? ext + 1 : ext)) ofn->Flags &= ~OFN_EXTENSIONDIFFERENT;
++            else ofn->Flags |= OFN_EXTENSIONDIFFERENT;
++        }
++        len = lstrlenW(list);
++        offset = PathFindFileNameW(list) - list;
++        ext_offset = *ext ? ext - list + 1 : 0;
++        list[len + 1] = 0;
++        if (!native_ofn_store(info, list, len + 1 + (multi ? 1 : 0), &offset))
++        {
++            free(list);
++            return FALSE;
++        }
++        if (!info->unicode && ext_offset)
++            ext_offset = WideCharToMultiByte(CP_ACP, 0, list, ext_offset, NULL, 0, NULL, NULL);
++        ofn->nFileOffset = offset;
++        ofn->nFileExtension = ext_offset;
++
++        if (ofn->lpstrFileTitle)
++        {
++            if (info->unicode)
++                lstrcpynW(ofn->lpstrFileTitle, PathFindFileNameW(list), ofn->nMaxFileTitle);
++            else
++                WideCharToMultiByte(CP_ACP, 0, PathFindFileNameW(list), -1,
++                                    (char *)ofn->lpstrFileTitle, ofn->nMaxFileTitle, NULL, NULL);
++        }
++        path = list;
++        FILEDLG95_MRU_save_filename(list);
++        if (!(ofn->Flags & OFN_NOCHANGEDIR))
++        {
++            PathRemoveFileSpecW(list);
++            SetCurrentDirectoryW(list);
++        }
++        free(list);
++        return TRUE;
++    }
++
++    if (!(ofn->Flags & OFN_NOCHANGEDIR))
++    {
++        WCHAR dir[MAX_PATH];
++        lstrcpynW(dir, res->paths[0], MAX_PATH);
++        PathRemoveFileSpecW(dir);
++        SetCurrentDirectoryW(dir);
++    }
++    return TRUE;
++}
++
++static BOOL native_get_file_name(FileOpenDlgInfos *info, BOOL save, BOOL *ret)
++{
++    OPENFILENAMEW *ofn = info->ofnInfos;
++    struct macdlg_session session;
++    struct macdlg_json json;
++    struct native_ofn res;
++    struct macdlg_owner owner_state;
++    UINT i;
++    int state;
++
++    if (is_dialog_hooked(info) || (ofn->Flags & (OFN_ENABLETEMPLATE | OFN_ENABLETEMPLATEHANDLE)))
++        return FALSE;
++    if (!save && (ofn->Flags & OFN_CREATEPROMPT)) return FALSE;
++    if (!macdlg_enabled()) return FALSE;
++
++    macdlg_json_init(&json);
++    native_ofn_request(info, save, &json);
++    macdlg_disable_owner(&owner_state, ofn->hwndOwner);
++    if (!macdlg_begin(&session, ofn->hwndOwner, &json))
++    {
++        macdlg_restore_owner(&owner_state, FALSE);
++        macdlg_json_free(&json);
++        return FALSE;
++    }
++    macdlg_json_free(&json);
++
++    memset(&res, 0, sizeof(res));
++    while (!(state = macdlg_step(&session, native_ofn_line, &res)) && !res.done)
++        ;
++    macdlg_end(&session);
++
++    if (state != MACDLG_NOT_STARTED)
++    {
++        COMDLG32_SetCommDlgExtendedError(0);
++        *ret = state >= 0 && res.ok && res.count && native_ofn_result(info, save, &res);
++        TRACE("native panel returns %d\n", *ret);
++    }
++    /* The panel did not come up: the Wine dialog instead. */
++    macdlg_restore_owner(&owner_state, state != MACDLG_NOT_STARTED);
++
++    for (i = 0; i < res.count; i++) free(res.paths[i]);
++    free(res.paths);
++    return state != MACDLG_NOT_STARTED;
++}
++
+ /***********************************************************************
+  *      GetFileDialog95
+  *
+@@ -548,11 +895,13 @@ static BOOL GetFileDialog95(FileOpenDlgInfos *info, UINT dlg_type)
+     switch (dlg_type)
+     {
+     case OPEN_DIALOG:
+-        ret = GetFileName95(info);
++        if (!native_get_file_name(info, FALSE, &ret))
++            ret = GetFileName95(info);
+         break;
+     case SAVE_DIALOG:
+         info->DlgInfos.dwDlgProp |= FODPROP_SAVEDLG;
+-        ret = GetFileName95(info);
++        if (!native_get_file_name(info, TRUE, &ret))
++            ret = GetFileName95(info);
+         break;
+     default:
+         ret = FALSE;
+diff --git a/dlls/comdlg32/itemdlg.c b/dlls/comdlg32/itemdlg.c
+index 6e47cb1..9e2dcd2 100644
+--- a/dlls/comdlg32/itemdlg.c
++++ b/dlls/comdlg32/itemdlg.c
+@@ -31,6 +31,7 @@
+ #include "commdlg.h"
+ #include "cdlg.h"
+ #include "filedlgbrowser.h"
++#include "macdlg.h"
+ 
+ #include "wine/debug.h"
+ #include "wine/list.h"
+@@ -147,6 +148,17 @@ typedef struct FileDialogImpl {
+     GUID client_guid;
+ 
+     HANDLE user_actctx;
++
++    /* MacSW native panel (macdlg.c) */
++    BOOL native_active;
++    BOOL native_window_asked;
++    BOOL native_close;
++    HRESULT native_close_hr;
++    BOOL native_prompted;
++    BOOL native_filename_changed;
++    BOOL native_folder_changed;
++    BOOL native_shadow;     /* dlg_hwnd is the hidden dialog window of a native Show() */
++    HWND native_shadow_hwnd;    /* that window, also while a Wine dialog replaces the panel */
+ } FileDialogImpl;
+ 
+ /**************************************************************************
+@@ -291,13 +303,16 @@ static HRESULT events_OnOverwrite(FileDialogImpl *This, IShellItem *shellitem)
+ 
+     if(SUCCEEDED(hr))
+     {
+-        if (response == FDEOR_DEFAULT)
++        /* NSSavePanel already asked the user about this file. */
++        if (response == FDEOR_DEFAULT && !This->native_prompted)
+         {
+             WCHAR buf[100];
+             int answer;
+ 
+             LoadStringW(COMDLG32_hInstance, IDS_OVERWRITEFILE, buf, 100);
+-            answer = MessageBoxW(This->dlg_hwnd, buf, This->custom_title,
++            /* Not owned by the hidden window of a native Show(): when the box
++               ends, its owner would become the active window. */
++            answer = MessageBoxW(This->native_shadow ? NULL : This->dlg_hwnd, buf, This->custom_title,
+                        MB_YESNO | MB_ICONEXCLAMATION);
+             if (answer == IDNO || answer == IDCANCEL)
+             {
+@@ -804,6 +819,23 @@ static HRESULT on_default_action(FileDialogImpl *This)
+     return ret;
+ }
+ 
++/* MacSW: the hidden window of a native Show() is never ended with EndDialog,
++   which would re-enable the owner while the panel is up; the panel ends
++   instead (native_dialog_show) and Show() returns hr. */
++static void end_dialog(FileDialogImpl *This, HRESULT hr)
++{
++    if (This->native_shadow)
++    {
++        if (!This->native_close)
++        {
++            This->native_close = TRUE;
++            This->native_close_hr = hr;
++        }
++        return;
++    }
++    EndDialog(This->dlg_hwnd, hr);
++}
++
+ static void show_opendropdown(FileDialogImpl *This)
+ {
+     HWND open_hwnd;
+@@ -827,7 +859,7 @@ static void show_opendropdown(FileDialogImpl *This)
+         This->opendropdown_selection = mii.wID;
+ 
+         if(SUCCEEDED(on_default_action(This)))
+-            EndDialog(This->dlg_hwnd, S_OK);
++            end_dialog(This, S_OK);
+         else
+             This->opendropdown_has_selection = FALSE;
+     }
+@@ -2103,6 +2135,8 @@ static LRESULT on_wm_initdialog(HWND hwnd, LPARAM lParam)
+ 
+     SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LPARAM)This);
+     This->dlg_hwnd = hwnd;
++    if (This->native_shadow)
++        This->native_shadow_hwnd = hwnd;
+ 
+     hitem = GetDlgItem(This->dlg_hwnd, pshHelp);
+     if(hitem) ShowWindow(hitem, SW_HIDE);
+@@ -2178,11 +2212,19 @@ static LRESULT on_wm_initdialog(HWND hwnd, LPARAM lParam)
+     }
+ 
+     ctrl_container_reparent(This, This->dlg_hwnd);
+-    init_explorerbrowser(This);
++    /* MacSW: the hidden window of a native Show() has no browser (no folder
++       enumeration, no navigation or selection events of its own). */
++    if (!This->native_shadow)
++        init_explorerbrowser(This);
+     init_toolbar(This, hwnd);
+     update_control_text(This);
+     update_layout(This);
+ 
++    /* native_dialog_show fires the opening events; no focus, which would
++       activate the hidden window. */
++    if (This->native_shadow)
++        return FALSE;
++
+     if(This->filterspec_count)
+         events_OnTypeChange(This);
+ 
+@@ -2234,8 +2276,12 @@ static LRESULT on_idok(FileDialogImpl *This)
+ {
+     TRACE("%p\n", This);
+ 
++    /* MacSW: the native panel accepts, not the hidden window. */
++    if (This->native_shadow)
++        return FALSE;
++
+     if(SUCCEEDED(on_default_action(This)))
+-        EndDialog(This->dlg_hwnd, S_OK);
++        end_dialog(This, S_OK);
+ 
+     return FALSE;
+ }
+@@ -2244,7 +2290,7 @@ static LRESULT on_idcancel(FileDialogImpl *This)
+ {
+     TRACE("%p\n", This);
+ 
+-    EndDialog(This->dlg_hwnd, HRESULT_FROM_WIN32(ERROR_CANCELLED));
++    end_dialog(This, HRESULT_FROM_WIN32(ERROR_CANCELLED));
+ 
+     return FALSE;
+ }
+@@ -2334,6 +2380,14 @@ static LRESULT on_browse_up(FileDialogImpl *This)
+ 
+ static LRESULT on_wm_command(FileDialogImpl *This, WPARAM wparam, LPARAM lparam)
+ {
++    if (!This) return FALSE;
++
++    /* MacSW: the hidden window of a native Show() has no browser and no
++       visible buttons; only Cancel and a file type change apply to it. */
++    if (This->native_shadow && LOWORD(wparam) != IDOK && LOWORD(wparam) != IDCANCEL &&
++        LOWORD(wparam) != IDC_FILETYPE)
++        return FALSE;
++
+     switch(LOWORD(wparam))
+     {
+     case IDOK:                return on_idok(This);
+@@ -2352,6 +2406,24 @@ static INT_PTR CALLBACK itemdlg_dlgproc(HWND hwnd, UINT umessage, WPARAM wparam,
+ {
+     FileDialogImpl *This = (FileDialogImpl*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+ 
++    /* MacSW: the hidden window of a native Show() stays hidden and inactive,
++       whatever the program does with it (ShowWindow, SetWindowPos,
++       SetWindowLong). Subclass procedures run first and pass the same
++       structure on. */
++    if (This && hwnd == This->native_shadow_hwnd)
++    {
++        if (umessage == WM_WINDOWPOSCHANGING)
++        {
++            ((WINDOWPOS *)lparam)->flags &= ~SWP_SHOWWINDOW;
++            ((WINDOWPOS *)lparam)->flags |= SWP_NOACTIVATE;
++        }
++        else if (umessage == WM_STYLECHANGING && wparam == GWL_STYLE)
++            ((STYLESTRUCT *)lparam)->styleNew &= ~WS_VISIBLE;
++        /* Kept behind a Wine dialog (native_shadow_park): inert. */
++        if (hwnd != This->dlg_hwnd)
++            return FALSE;
++    }
++
+     switch(umessage)
+     {
+     case WM_INITDIALOG:       return on_wm_initdialog(hwnd, lparam);
+@@ -2364,6 +2436,93 @@ static INT_PTR CALLBACK itemdlg_dlgproc(HWND hwnd, UINT umessage, WPARAM wparam,
+     return FALSE;
+ }
+ 
++/* MacSW: the dialog window of a native Show(), hidden: the window that the
++   Wine dialog would show (same template, controls and ids), so programs that
++   ask for it with IOleWindow::GetWindow, subclass it or put their own windows
++   into it find what they expect. No WS_VISIBLE, no browser, no focus; it is
++   never ended with EndDialog (end_dialog), only destroyed. */
++static void native_shadow_destroy(FileDialogImpl *This)
++{
++    HWND hwnd = This->native_shadow_hwnd;
++
++    /* WM_DESTROY -> on_wm_destroy (unless parked): custom controls back into
++       their hidden container, dlg_hwnd = NULL. The program's windows inside
++       go with it. */
++    if (hwnd && IsWindow(hwnd))
++    {
++        TRACE("destroying the hidden dialog window %p\n", hwnd);
++        /* Parked: WM_DESTROY handlers of the program ask for the window they
++           know (GetWindow), as when a dialog closes. */
++        if (!This->dlg_hwnd) This->dlg_hwnd = hwnd;
++        DestroyWindow(hwnd);
++    }
++    This->native_shadow_hwnd = NULL;
++    This->native_shadow = FALSE;
++    if (This->user_actctx != INVALID_HANDLE_VALUE)
++    {
++        ReleaseActCtx(This->user_actctx);
++        This->user_actctx = INVALID_HANDLE_VALUE;
++    }
++}
++
++/* The Wine dialog replaces the panel (rule 5, or the panel did not start).
++   The program may hold on to the hidden window: SOLIDWORKS's open options
++   keep their state in it and are not built again. So it stays, hidden and
++   inert, until Show() ends (IFileDialog2_fnShow). */
++static void native_shadow_park(FileDialogImpl *This)
++{
++    TRACE("keeping the hidden dialog window %p until Show() ends\n", This->native_shadow_hwnd);
++    This->native_shadow = FALSE;
++    This->dlg_hwnd = NULL;
++    /* create_dialog takes the caller's activation context again. */
++    if (This->user_actctx != INVALID_HANDLE_VALUE)
++    {
++        ReleaseActCtx(This->user_actctx);
++        This->user_actctx = INVALID_HANDLE_VALUE;
++    }
++}
++
++static BOOL native_shadow_create(FileDialogImpl *This, HWND owner)
++{
++    ULONG_PTR ctx_cookie = 0;
++    DLGTEMPLATE *template;
++    HGLOBAL mem;
++    HRSRC res;
++    DWORD size;
++
++    if (!(res = FindResourceW(COMDLG32_hInstance, MAKEINTRESOURCEW(NEWFILEOPENV3ORD), (LPCWSTR)RT_DIALOG)) ||
++        !(size = SizeofResource(COMDLG32_hInstance, res)) || size < sizeof(DLGTEMPLATE) ||
++        !(mem = LoadResource(COMDLG32_hInstance, res)) || !(template = malloc(size)))
++        return FALSE;
++    memcpy(template, LockResource(mem), size);
++    /* user32 shows a dialog after WM_INITDIALOG when its template says WS_VISIBLE. */
++    if (((WORD *)template)[1] == 0xffff)    /* DLGTEMPLATEEX: style at offset 12 */
++        ((DWORD *)template)[3] &= ~WS_VISIBLE;
++    else
++        template->style &= ~WS_VISIBLE;
++
++    /* As create_dialog: events run in the caller's activation context, the
++       dialog's controls are created with comctl32 v6. */
++    if (!GetCurrentActCtx(&This->user_actctx))
++        This->user_actctx = INVALID_HANDLE_VALUE;
++    if (COMDLG32_hActCtx != INVALID_HANDLE_VALUE)
++        ActivateActCtx(COMDLG32_hActCtx, &ctx_cookie);
++    This->native_shadow = TRUE;
++    CreateDialogIndirectParamW(COMDLG32_hInstance, template, owner, itemdlg_dlgproc, (LPARAM)This);
++    if (COMDLG32_hActCtx != INVALID_HANDLE_VALUE)
++        DeactivateActCtx(0, ctx_cookie);
++    free(template);
++
++    if (This->dlg_hwnd)  /* set by on_wm_initdialog */
++    {
++        TRACE("hidden dialog window %p\n", This->dlg_hwnd);
++        return TRUE;
++    }
++    WARN("could not create the hidden dialog window\n");
++    native_shadow_destroy(This);
++    return FALSE;
++}
++
+ static HRESULT create_dialog(FileDialogImpl *This, HWND parent)
+ {
+     ULONG_PTR ctx_cookie = 0;
+@@ -2403,6 +2562,601 @@ static HRESULT create_dialog(FileDialogImpl *This, HWND parent)
+     return (HRESULT)res;
+ }
+ 
++/**************************************************************************
++ * MacSW native panel (macdlg.h): with MACSW_NATIVE_FILE_DIALOGS=1, Show()
++ * runs NSOpenPanel/NSSavePanel instead of the Wine dialog. The dialog state
++ * stays where the Wine dialog keeps it (folder, selection, file type, the
++ * hidden custom control windows, results), so every getter and event works
++ * as before. The Wine dialog's window exists too, hidden (native_shadow_create),
++ * from before the first event to the end of Show(): IOleWindow::GetWindow
++ * returns it, and programs that subclass it or put their own windows into it
++ * (SOLIDWORKS's open options pane) work as with the Wine dialog, unseen. A
++ * program that asks for the window while the dialog opens gets the visible
++ * Wine dialog instead, unless MACSW_NATIVE_FILE_DIALOGS=all.
++ */
++static const char * const native_control_types[] =
++{
++    "menu", "button", "combo", "radio", "check", "edit", "separator", "text", NULL, "group"
++};
++
++struct native_context
++{
++    FileDialogImpl *This;
++    struct macdlg_session *session;
++    BOOL done, ok;
++    UINT panel_type;
++    UINT count;
++    WCHAR **paths;
++};
++
++static WCHAR *native_window_text(HWND hwnd)
++{
++    int len = GetWindowTextLengthW(hwnd);
++    WCHAR *text = malloc((len + 1) * sizeof(WCHAR));
++
++    if (text && !GetWindowTextW(hwnd, text, len + 1)) text[0] = 0;
++    return text;
++}
++
++static WCHAR *native_wcsdup_utf8(const char *str)
++{
++    int len = MultiByteToWideChar(CP_UTF8, 0, str, -1, NULL, 0);
++    WCHAR *ret = malloc(len * sizeof(WCHAR));
++
++    if (ret) MultiByteToWideChar(CP_UTF8, 0, str, -1, ret, len);
++    return ret;
++}
++
++static void native_write_control(FileDialogImpl *This, struct macdlg_json *json, customctrl *ctrl)
++{
++    IFileDialogCustomize *customize = &This->IFileDialogCustomize_iface;
++    WCHAR *text = NULL;
++    cctrl_item *item;
++    customctrl *sub;
++    DWORD selected;
++    BOOL checked = FALSE;
++
++    if (ctrl->type >= ARRAY_SIZE(native_control_types) || !native_control_types[ctrl->type]) return;
++
++    macdlg_json_open(json, NULL, '{');
++    macdlg_json_int(json, "id", ctrl->id);
++    macdlg_json_utf8(json, "type", native_control_types[ctrl->type]);
++    macdlg_json_bool(json, "visible", (ctrl->cdcstate & CDCS_VISIBLE) != 0);
++    macdlg_json_bool(json, "enabled", (ctrl->cdcstate & CDCS_ENABLED) != 0);
++
++    switch (ctrl->type)
++    {
++    case IDLG_CCTRL_MENU:
++    {
++        int len = SendMessageW(ctrl->hwnd, TB_GETBUTTONTEXTW, 1, 0);
++        if (len > 0 && (text = malloc((len + 1) * sizeof(WCHAR))))
++            SendMessageW(ctrl->hwnd, TB_GETBUTTONTEXTW, 1, (LPARAM)text);
++        macdlg_json_string(json, "label", text);
++        break;
++    }
++    case IDLG_CCTRL_PUSHBUTTON:
++    case IDLG_CCTRL_CHECKBUTTON:
++    case IDLG_CCTRL_TEXT:
++    case IDLG_CCTRL_VISUALGROUP:
++        macdlg_json_string(json, "label", text = native_window_text(ctrl->hwnd));
++        break;
++    case IDLG_CCTRL_EDITBOX:
++        macdlg_json_string(json, "text", text = native_window_text(ctrl->hwnd));
++        break;
++    default:
++        break;
++    }
++    free(text);
++
++    if (ctrl->type == IDLG_CCTRL_CHECKBUTTON)
++    {
++        IFileDialogCustomize_GetCheckButtonState(customize, ctrl->id, &checked);
++        macdlg_json_bool(json, "checked", checked);
++    }
++
++    if (ctrl->type == IDLG_CCTRL_COMBOBOX || ctrl->type == IDLG_CCTRL_RADIOBUTTONLIST ||
++        ctrl->type == IDLG_CCTRL_MENU)
++    {
++        macdlg_json_open(json, "items", '[');
++        LIST_FOR_EACH_ENTRY(item, &ctrl->sub_items, cctrl_item, entry)
++        {
++            macdlg_json_open(json, NULL, '{');
++            macdlg_json_int(json, "id", item->id);
++            macdlg_json_string(json, "label", item->label);
++            macdlg_json_bool(json, "visible", (item->cdcstate & CDCS_VISIBLE) != 0);
++            macdlg_json_bool(json, "enabled", (item->cdcstate & CDCS_ENABLED) != 0);
++            macdlg_json_close(json, '}');
++        }
++        macdlg_json_close(json, ']');
++        if (ctrl->type != IDLG_CCTRL_MENU &&
++            SUCCEEDED(IFileDialogCustomize_GetSelectedControlItem(customize, ctrl->id, &selected)))
++            macdlg_json_int(json, "selected", selected);
++    }
++
++    if (ctrl->type == IDLG_CCTRL_VISUALGROUP)
++    {
++        macdlg_json_open(json, "children", '[');
++        LIST_FOR_EACH_ENTRY(sub, &ctrl->sub_cctrls, customctrl, sub_cctrls_entry)
++            native_write_control(This, json, sub);
++        macdlg_json_close(json, ']');
++    }
++
++    macdlg_json_close(json, '}');
++}
++
++static void native_write_controls(FileDialogImpl *This, struct macdlg_json *json)
++{
++    customctrl *ctrl;
++
++    macdlg_json_open(json, "controls", '[');
++    LIST_FOR_EACH_ENTRY(ctrl, &This->cctrls, customctrl, entry)
++        native_write_control(This, json, ctrl);
++    macdlg_json_close(json, ']');
++}
++
++static void native_write_request(FileDialogImpl *This, struct macdlg_json *json)
++{
++    const WCHAR *ok_label = This->custom_okbutton;
++    WCHAR *folder;
++    cctrl_item *item;
++    UINT i;
++
++    if (This->hmenu_opendropdown && (item = get_first_item(&This->cctrl_opendropdown)))
++        ok_label = item->label;
++
++    macdlg_json_open(json, NULL, '{');
++    if (This->options & FOS_PICKFOLDERS)
++        macdlg_json_utf8(json, "mode", "folder");
++    else
++        macdlg_json_utf8(json, "mode", This->dlg_type == ITEMDLG_TYPE_SAVE ? "save" : "open");
++    macdlg_json_string(json, "title", This->custom_title);
++    macdlg_json_string(json, "okLabel", ok_label);
++    macdlg_json_string(json, "nameLabel", This->custom_filenamelabel);
++    if (This->psi_folder && SUCCEEDED(IShellItem_GetDisplayName(This->psi_folder, SIGDN_FILESYSPATH, &folder)))
++    {
++        macdlg_json_folder(json, folder);
++        CoTaskMemFree(folder);
++    }
++    if (This->set_filename && !wcspbrk(This->set_filename, L"*?"))
++        macdlg_json_string(json, "fileName", This->set_filename);
++    macdlg_json_open(json, "filters", '[');
++    for (i = 0; i < This->filterspec_count; i++)
++        macdlg_json_filter(json, This->filterspecs[i].pszName, This->filterspecs[i].pszSpec);
++    macdlg_json_close(json, ']');
++    macdlg_json_int(json, "filterIndex", This->filetypeindex);
++    macdlg_json_string(json, "defaultExt", This->default_ext);
++    macdlg_json_bool(json, "appendExtension", TRUE);
++    macdlg_json_bool(json, "multiple", (This->options & FOS_ALLOWMULTISELECT) != 0);
++    macdlg_json_bool(json, "showHidden", (This->options & FOS_FORCESHOWHIDDEN) != 0);
++    native_write_controls(This, json);
++    macdlg_json_test(json);
++    macdlg_json_close(json, '}');
++}
++
++static void native_set_folder(FileDialogImpl *This, IShellItem *folder)
++{
++    if (This->psi_folder) IShellItem_Release(This->psi_folder);
++    This->psi_folder = folder;
++}
++
++static IShellItem *native_item_from_unix(const char *unix_path)
++{
++    WCHAR *path = macdlg_dos_path(unix_path);
++    IShellItem *item = NULL;
++
++    if (path) SHCreateItemFromParsingName(path, NULL, &IID_IShellItem, (void **)&item);
++    HeapFree(GetProcessHeap(), 0, path);
++    return item;
++}
++
++static void native_set_selection(FileDialogImpl *This, int count, char **unix_paths)
++{
++    IShellFolder *desktop;
++    LPITEMIDLIST *pidls;
++    int i, n = 0;
++
++    if (This->psia_selection)
++    {
++        IShellItemArray_Release(This->psia_selection);
++        This->psia_selection = NULL;
++    }
++    if (count > 0 && (pidls = calloc(count, sizeof(*pidls))))
++    {
++        for (i = 0; i < count; i++)
++        {
++            WCHAR *path = macdlg_dos_path(unix_paths[i]);
++            if (path && (pidls[n] = SHSimpleIDListFromPath(path))) n++;
++            HeapFree(GetProcessHeap(), 0, path);
++        }
++        if (n && SUCCEEDED(SHGetDesktopFolder(&desktop)))
++        {
++            SHCreateShellItemArray(NULL, desktop, n, (PCUITEMID_CHILD_ARRAY)pidls, &This->psia_selection);
++            IShellFolder_Release(desktop);
++        }
++        for (i = 0; i < n; i++) ILFree(pidls[i]);
++        free(pidls);
++    }
++    fill_filename_from_selection(This);
++    events_OnSelectionChange(This);
++}
++
++static void json_busy(struct macdlg_json *json, BOOL busy)
++{
++    macdlg_json_open(json, NULL, '{');
++    macdlg_json_bool(json, "busy", busy);
++    macdlg_json_close(json, '}');
++}
++
++static void native_on_line(void *context, int argc, char **argv)
++{
++    struct native_context *ctx = context;
++    FileDialogImpl *This = ctx->This;
++    IFileDialogCustomize *customize = &This->IFileDialogCustomize_iface;
++    DWORD id = argc >= 2 ? strtoul(argv[1], NULL, 10) : 0;
++
++    if (!strcmp(argv[0], "folder") && argc >= 2)
++    {
++        IShellItem *folder = native_item_from_unix(argv[1]);
++
++        if (!folder) return;
++        events_OnFolderChanging(This, folder);
++        native_set_folder(This, folder);
++        events_OnFolderChange(This);
++    }
++    else if (!strcmp(argv[0], "selection"))
++    {
++        native_set_selection(This, argc - 1, argv + 1);
++    }
++    else if (!strcmp(argv[0], "type") && argc >= 2)
++    {
++        if (id < This->filterspec_count) ctx->panel_type = id;
++        if (id < This->filterspec_count && id != This->filetypeindex)
++        {
++            This->filetypeindex = id;
++            set_current_filter(This, This->filterspecs[id].pszSpec);
++            /* As a choice in the Wine dialog's type box. */
++            SendDlgItemMessageW(This->dlg_hwnd, IDC_FILETYPE, CB_SETCURSEL, id, 0);
++            events_OnTypeChange(This);
++        }
++    }
++    else if (!strcmp(argv[0], "check") && argc >= 3)
++    {
++        BOOL checked = atoi(argv[2]) != 0;
++
++        IFileDialogCustomize_SetCheckButtonState(customize, id, checked);
++        cctrl_event_OnCheckButtonToggled(This, id, checked);
++    }
++    else if (!strcmp(argv[0], "item") && argc >= 3)
++    {
++        customctrl *ctrl = get_cctrl(This, id);
++        DWORD item = strtoul(argv[2], NULL, 10);
++
++        if (!ctrl) return;
++        if (ctrl->type != IDLG_CCTRL_MENU)
++            IFileDialogCustomize_SetSelectedControlItem(customize, id, item);
++        cctrl_event_OnItemSelected(This, id, item);
++    }
++    else if (!strcmp(argv[0], "button") && argc >= 2)
++    {
++        /* The handler may run a modal dialog ("Options..."); the panel ignores
++           the mouse meanwhile, as Windows disables the file dialog. */
++        struct macdlg_json busy;
++
++        macdlg_json_init(&busy);
++        json_busy(&busy, TRUE);
++        macdlg_update(ctx->session, &busy);
++        cctrl_event_OnButtonClicked(This, id);
++        macdlg_json_free(&busy);
++        json_busy(&busy, FALSE);
++        macdlg_update(ctx->session, &busy);
++        macdlg_json_free(&busy);
++    }
++    else if (!strcmp(argv[0], "edit") && argc >= 3)
++    {
++        WCHAR *text = native_wcsdup_utf8(argv[2]);
++
++        if (text) IFileDialogCustomize_SetEditBoxText(customize, id, text);
++        free(text);
++    }
++    else if (!strcmp(argv[0], "path") && argc >= 2)
++    {
++        WCHAR *path = macdlg_dos_path(argv[1]), **paths;
++
++        if (path && (paths = realloc(ctx->paths, (ctx->count + 1) * sizeof(*paths))))
++        {
++            ctx->paths = paths;
++            if ((paths[ctx->count] = malloc((lstrlenW(path) + 1) * sizeof(WCHAR))))
++                lstrcpyW(paths[ctx->count++], path);
++        }
++        HeapFree(GetProcessHeap(), 0, path);
++    }
++    else if (!strcmp(argv[0], "result") && argc >= 2)
++    {
++        ctx->done = TRUE;
++        ctx->ok = !strcmp(argv[1], "ok");
++    }
++}
++
++static void native_controls_json(FileDialogImpl *This, struct macdlg_json *json)
++{
++    macdlg_json_init(json);
++    macdlg_json_open(json, NULL, '{');
++    native_write_controls(This, json);
++    macdlg_json_close(json, '}');
++}
++
++/* Send what the application changed, in its event handlers or at any other
++   time while the panel is up: controls, file name, file type and folder. */
++static void native_push_update(FileDialogImpl *This, struct native_context *ctx, struct macdlg_json *last)
++{
++    struct macdlg_json json;
++    WCHAR *folder;
++    BOOL changed = FALSE;
++
++    native_controls_json(This, &json);
++    if (!last->data || !json.data || strcmp(last->data, json.data))
++    {
++        macdlg_update(ctx->session, &json);
++        macdlg_json_free(last);
++        *last = json;
++    }
++    else macdlg_json_free(&json);
++
++    macdlg_json_init(&json);
++    macdlg_json_open(&json, NULL, '{');
++    if (This->native_filename_changed && This->set_filename)
++    {
++        macdlg_json_string(&json, "fileName", This->set_filename);
++        changed = TRUE;
++    }
++    if (This->filetypeindex != ctx->panel_type && This->filetypeindex < This->filterspec_count)
++    {
++        macdlg_json_int(&json, "filterIndex", This->filetypeindex);
++        ctx->panel_type = This->filetypeindex;
++        changed = TRUE;
++    }
++    if (This->native_folder_changed && This->psi_setfolder &&
++        SUCCEEDED(IShellItem_GetDisplayName(This->psi_setfolder, SIGDN_FILESYSPATH, &folder)))
++    {
++        macdlg_json_folder(&json, folder);
++        CoTaskMemFree(folder);
++        changed = TRUE;
++    }
++    macdlg_json_close(&json, '}');
++    if (changed) macdlg_update(ctx->session, &json);
++    macdlg_json_free(&json);
++    This->native_filename_changed = FALSE;
++    This->native_folder_changed = FALSE;
++}
++
++/* The user picked something: results, folder and name like on_default_action(). */
++static HRESULT native_accept(FileDialogImpl *This, struct native_context *ctx)
++{
++    IShellFolder *desktop;
++    LPITEMIDLIST *pidls;
++    WCHAR *path, *dir, extbuf[MAX_PATH], *newext = NULL;
++    IShellItem *item;
++    HRESULT hr;
++    UINT i;
++
++    /* NSSavePanel appended the type's extension and confirmed any overwrite.
++       Windows also adds the extension when the name has none; a name that
++       needs it here was not checked by the panel. */
++    This->native_prompted = TRUE;
++    if (This->dlg_type == ITEMDLG_TYPE_SAVE && !(This->options & FOS_PICKFOLDERS) &&
++        !*PathFindExtensionW(ctx->paths[0]))
++    {
++        if (This->current_filter)
++            newext = get_first_ext_from_spec(extbuf, This->current_filter);
++        if (!newext && This->default_ext)
++        {
++            lstrcpyW(extbuf, L".");
++            lstrcpynW(extbuf + 1, This->default_ext, ARRAY_SIZE(extbuf) - 1);
++            newext = extbuf;
++        }
++        if (newext && (path = malloc((lstrlenW(ctx->paths[0]) + lstrlenW(newext) + 1) * sizeof(WCHAR))))
++        {
++            lstrcpyW(path, ctx->paths[0]);
++            lstrcatW(path, newext);
++            free(ctx->paths[0]);
++            ctx->paths[0] = path;
++            This->native_prompted = FALSE;
++        }
++    }
++
++    hr = SHGetDesktopFolder(&desktop);
++    if (FAILED(hr)) return hr;
++    if (!(pidls = calloc(ctx->count, sizeof(*pidls))))
++    {
++        IShellFolder_Release(desktop);
++        return E_OUTOFMEMORY;
++    }
++    for (i = 0; i < ctx->count; i++)
++        pidls[i] = SHSimpleIDListFromPath(ctx->paths[i]);
++    if (This->psia_results)
++    {
++        IShellItemArray_Release(This->psia_results);
++        This->psia_results = NULL;
++    }
++    hr = SHCreateShellItemArray(NULL, desktop, ctx->count, (PCUITEMID_CHILD_ARRAY)pidls, &This->psia_results);
++    IShellFolder_Release(desktop);
++    for (i = 0; i < ctx->count; i++) ILFree(pidls[i]);
++    free(pidls);
++    if (FAILED(hr)) return hr;
++
++    /* GetFolder() and GetFileName() as the Wine dialog leaves them; also where a re-shown panel starts. */
++    if ((dir = malloc((lstrlenW(ctx->paths[0]) + 1) * sizeof(WCHAR))))
++    {
++        lstrcpyW(dir, ctx->paths[0]);
++        PathRemoveFileSpecW(dir);
++        if (SUCCEEDED(SHCreateItemFromParsingName(dir, NULL, &IID_IShellItem, (void **)&item)))
++            native_set_folder(This, item);
++        free(dir);
++    }
++    if (This->options & FOS_PICKFOLDERS)
++        set_file_name(This, ctx->paths[0]);
++    else
++        set_file_name(This, PathFindFileNameW(ctx->paths[0]));
++
++    if ((This->options & FOS_OVERWRITEPROMPT) && This->dlg_type == ITEMDLG_TYPE_SAVE)
++    {
++        for (i = 0; SUCCEEDED(hr) && i < ctx->count; i++)
++        {
++            if (FAILED(IShellItemArray_GetItemAt(This->psia_results, i, &item))) continue;
++            if (shell_item_exists(item)) hr = events_OnOverwrite(This, item);
++            IShellItem_Release(item);
++        }
++        if (FAILED(hr)) return S_FALSE;
++    }
++
++    return events_OnFileOk(This) == S_OK ? S_OK : S_FALSE;
++}
++
++/* FALSE: the Wine dialog instead; *parked when the hidden window waits behind it. */
++static BOOL native_dialog_show(FileDialogImpl *This, HWND owner, HRESULT *result, BOOL *parked)
++{
++    struct macdlg_session session;
++    struct native_context ctx;
++    struct macdlg_json json, last;
++    struct macdlg_owner owner_state;
++    IShellItem *folder;
++    BOOL first = TRUE, fallback = FALSE;
++    HRESULT hr;
++    UINT i;
++    int state;
++
++    if (This->native_active || This->dlg_hwnd) return FALSE;
++    /* NSOpenPanel cannot take the name of a file that does not exist yet. */
++    if (This->dlg_type == ITEMDLG_TYPE_OPEN && (This->options & FOS_CREATEPROMPT)) return FALSE;
++    if (!macdlg_enabled()) return FALSE;
++
++    This->native_active = TRUE;
++    This->native_window_asked = FALSE;
++    This->native_close = FALSE;
++
++    /* The owner stays disabled until Show() returns, OnFileOk included; like
++       DialogBox, from before the dialog window exists. */
++    macdlg_disable_owner(&owner_state, owner);
++
++    /* The dialog window exists, hidden, before the first event: programs that
++       ask for it in their handlers get it (GetWindow), as with the Wine dialog. */
++    if (!native_shadow_create(This, owner))
++    {
++        macdlg_restore_owner(&owner_state, FALSE);
++        This->native_active = FALSE;
++        return FALSE;
++    }
++
++    /* Start like the Wine dialog: navigate to the folder, then announce the file type. */
++    folder = This->psi_setfolder ? This->psi_setfolder : This->psi_defaultfolder;
++    if (folder)
++    {
++        events_OnFolderChanging(This, folder);
++        IShellItem_AddRef(folder);
++        native_set_folder(This, folder);
++        events_OnFolderChange(This);
++    }
++    if (This->filterspec_count)
++        events_OnTypeChange(This);
++
++    /* A program that asked for the dialog window just now put its own windows
++       into it; under the panel nobody would see them. Unless
++       MACSW_NATIVE_FILE_DIALOGS=all, the visible Wine dialog instead: its
++       handlers run again there, with that window. */
++    if (This->native_window_asked && !macdlg_everywhere())
++    {
++        TRACE("the program asked for the dialog window, using the Wine dialog\n");
++        native_shadow_park(This);
++        *parked = TRUE;
++        macdlg_restore_owner(&owner_state, FALSE);
++        This->native_active = FALSE;
++        return FALSE;
++    }
++
++    hr = This->native_close ? This->native_close_hr : S_FALSE;
++    while (hr == S_FALSE && !This->native_close)
++    {
++        macdlg_json_init(&json);
++        native_write_request(This, &json);
++        if (!macdlg_begin(&session, owner, &json))
++        {
++            macdlg_json_free(&json);
++            fallback = first;
++            hr = E_FAIL;
++            break;
++        }
++        macdlg_json_free(&json);
++
++        memset(&ctx, 0, sizeof(ctx));
++        ctx.This = This;
++        ctx.session = &session;
++        ctx.panel_type = This->filetypeindex;
++        This->native_filename_changed = FALSE;
++        This->native_folder_changed = FALSE;
++        native_controls_json(This, &last);
++
++        while (!(state = macdlg_step(&session, native_on_line, &ctx)) && !ctx.done)
++        {
++            if (This->native_close && !session.cancelled)
++                macdlg_cancel(&session);
++            native_push_update(This, &ctx, &last);
++            /* Backstop for SetWindowPos(SWP_SHOWWINDOW | SWP_NOSENDCHANGING),
++               which WM_WINDOWPOSCHANGING cannot see. */
++            if (This->dlg_hwnd && IsWindowVisible(This->dlg_hwnd))
++            {
++                WARN("the program showed the hidden dialog window, hiding it\n");
++                ShowWindow(This->dlg_hwnd, SW_HIDE);
++            }
++        }
++        macdlg_json_free(&last);
++        macdlg_end(&session);
++
++        if (state == MACDLG_NOT_STARTED)
++        {
++            fallback = first;
++            hr = E_FAIL;
++        }
++        else if (This->native_close)
++            hr = This->native_close_hr;
++        else if (state < 0 || !ctx.ok || !ctx.count)
++            hr = HRESULT_FROM_WIN32(ERROR_CANCELLED);
++        else
++        {
++            hr = native_accept(This, &ctx);
++            if (This->native_close) hr = This->native_close_hr;
++        }
++        This->native_prompted = FALSE;
++
++        for (i = 0; i < ctx.count; i++) free(ctx.paths[i]);
++        free(ctx.paths);
++        if (fallback) break;
++        first = FALSE;
++        /* S_FALSE: OnFileOk (or OnOverwrite) refused; show the panel again where the user was. */
++    }
++    /* After OnFileOk, as Windows destroys its dialog; before the owner is
++       enabled again, and while handlers still see a native Show(). */
++    if (fallback)
++    {
++        native_shadow_park(This);
++        *parked = TRUE;
++    }
++    else
++        native_shadow_destroy(This);
++    This->native_active = FALSE;
++
++    /* The first panel could not start: the Wine dialog instead. */
++    if (fallback)
++    {
++        macdlg_restore_owner(&owner_state, FALSE);
++        return FALSE;
++    }
++
++    macdlg_restore_owner(&owner_state, TRUE);
++    TRACE("native panel returns 0x%08lx\n", hr);
++    *result = hr;
++    return TRUE;
++}
++
+ /**************************************************************************
+  * IFileDialog implementation
+  */
+@@ -2522,11 +3276,21 @@ static ULONG WINAPI IFileDialog2_fnRelease(IFileDialog2 *iface)
+ static HRESULT WINAPI IFileDialog2_fnShow(IFileDialog2 *iface, HWND hwndOwner)
+ {
+     FileDialogImpl *This = impl_from_IFileDialog2(iface);
++    BOOL parked = FALSE;
++    HRESULT hr;
+     TRACE("%p (%p)\n", iface, hwndOwner);
+ 
+     This->opendropdown_has_selection = FALSE;
+ 
+-    return create_dialog(This, hwndOwner);
++    /* MacSW: Show() again while this dialog's panel is up. */
++    if (This->native_active) return E_UNEXPECTED;
++    if (native_dialog_show(This, hwndOwner, &hr, &parked))
++        return hr;
++
++    hr = create_dialog(This, hwndOwner);
++    if (parked)
++        native_shadow_destroy(This);  /* the hidden window kept behind the Wine dialog */
++    return hr;
+ }
+ 
+ static HRESULT WINAPI IFileDialog2_fnSetFileTypes(IFileDialog2 *iface, UINT cFileTypes,
+@@ -2724,6 +3488,7 @@ static HRESULT WINAPI IFileDialog2_fnSetFolder(IFileDialog2 *iface, IShellItem *
+ 
+     if(This->psi_setfolder)
+         IShellItem_AddRef(This->psi_setfolder);
++    if (This->native_active) This->native_folder_changed = TRUE;
+ 
+     return S_OK;
+ }
+@@ -2780,6 +3545,7 @@ static HRESULT WINAPI IFileDialog2_fnSetFileName(IFileDialog2 *iface, LPCWSTR ps
+     TRACE("%p (%s)\n", iface, debugstr_w(pszName));
+ 
+     set_file_name(This, pszName);
++    if (This->native_active) This->native_filename_changed = TRUE;
+ 
+     return S_OK;
+ }
+@@ -2886,6 +3652,14 @@ static HRESULT WINAPI IFileDialog2_fnClose(IFileDialog2 *iface, HRESULT hr)
+     FileDialogImpl *This = impl_from_IFileDialog2(iface);
+     TRACE("%p (0x%08lx)\n", This, hr);
+ 
++    if(This->native_active)
++    {
++        /* The panel ends; the hidden dialog window is destroyed, not ended. */
++        This->native_close = TRUE;
++        This->native_close_hr = hr;
++        return S_OK;
++    }
++
+     if(This->dlg_hwnd)
+         EndDialog(This->dlg_hwnd, hr);
+ 
+@@ -3856,6 +4630,13 @@ static HRESULT WINAPI IOleWindow_fnGetWindow(IOleWindow *iface, HWND *phwnd)
+     FileDialogImpl *This = impl_from_IOleWindow(iface);
+     TRACE("%p (%p)\n", This, phwnd);
+     *phwnd = This->dlg_hwnd;
++    /* MacSW: during a native Show() this is the hidden dialog window, from the
++       first event on (native_dialog_show); rule 5 notes that it was asked for. */
++    if (This->native_active)
++    {
++        This->native_window_asked = TRUE;
++        if (!This->dlg_hwnd) return E_FAIL;
++    }
+     return S_OK;
+ }
+ 
+diff --git a/dlls/comdlg32/macdlg.c b/dlls/comdlg32/macdlg.c
+new file mode 100644
+index 0000000..69136fa
+--- /dev/null
++++ b/dlls/comdlg32/macdlg.c
+@@ -0,0 +1,530 @@
++/*
++ * MacSW: macOS native file dialogs for comdlg32
++ *
++ * Copyright 2026 MacSW contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "windef.h"
++#include "winbase.h"
++#include "winnls.h"
++#include "winuser.h"
++#include "macdlg.h"
++
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(commdlg);
++
++/* enum macdrv_file_dialog_op in dlls/winemac.drv/unixlib.h */
++enum
++{
++    MACDLG_BEGIN,
++    MACDLG_POLL,
++    MACDLG_UPDATE,
++    MACDLG_CANCEL,
++    MACDLG_RELEASE,
++};
++
++typedef INT (WINAPI *macsw_file_dialog_func)(UINT op, UINT dialog, HWND owner, const char *in, UINT in_len,
++                                             char *out, UINT out_size, UINT *out_len);
++static macsw_file_dialog_func pmacsw_file_dialog;
++static char * (CDECL *pwine_get_unix_file_name)(const WCHAR *path);
++static WCHAR * (CDECL *pwine_get_dos_file_name)(const char *path);
++
++static WCHAR *get_env(const WCHAR *name)
++{
++    DWORD len = GetEnvironmentVariableW(name, NULL, 0);
++    WCHAR *value;
++
++    if (!len || !(value = malloc(len * sizeof(WCHAR)))) return NULL;
++    if (GetEnvironmentVariableW(name, value, len) >= len)
++    {
++        free(value);
++        return NULL;
++    }
++    return value;
++}
++
++/* MACSW_NATIVE_FILE_DIALOGS: 1 = native panels, 2 = "all" (also where the
++   program asks for the dialog window, see itemdlg.c), 0 = Wine dialogs. */
++static int gate_value(void)
++{
++    WCHAR *value = get_env(L"MACSW_NATIVE_FILE_DIALOGS");
++    int ret = 0;
++
++    if (value && !wcscmp(value, L"1")) ret = 1;
++    else if (value && !wcscmp(value, L"all")) ret = 2;
++    free(value);
++    return ret;
++}
++
++BOOL macdlg_everywhere(void)
++{
++    return gate_value() == 2;
++}
++
++/* The gate: MACSW_NATIVE_FILE_DIALOGS=1 (or all) and a winemac.drv with the export. */
++BOOL macdlg_enabled(void)
++{
++    HMODULE module;
++
++    if (!gate_value()) return FALSE;
++    if (pmacsw_file_dialog) return TRUE;
++
++    module = GetModuleHandleW(L"kernel32.dll");
++    pwine_get_unix_file_name = (void *)GetProcAddress(module, "wine_get_unix_file_name");
++    pwine_get_dos_file_name = (void *)GetProcAddress(module, "wine_get_dos_file_name");
++    if (!pwine_get_unix_file_name || !pwine_get_dos_file_name) return FALSE;
++
++    if (!(module = GetModuleHandleW(L"winemac.drv")))
++    {
++        TRACE("winemac.drv is not loaded, using the Wine dialog\n");
++        return FALSE;
++    }
++    pmacsw_file_dialog = (macsw_file_dialog_func)GetProcAddress(module, "macsw_file_dialog");
++    if (!pmacsw_file_dialog) WARN("winemac.drv has no macsw_file_dialog, using the Wine dialog\n");
++    return pmacsw_file_dialog != NULL;
++}
++
++/* Both return memory from the process heap (HeapFree). */
++char *macdlg_unix_path(const WCHAR *dos_path)
++{
++    return dos_path && dos_path[0] ? pwine_get_unix_file_name(dos_path) : NULL;
++}
++
++/* Windows cannot open names with these characters, a control character, or a
++   trailing dot or space; ':' is left alone (Wine opens such names). */
++static BOOL is_windows_name(const WCHAR *name)
++{
++    size_t len = wcslen(name), i;
++
++    if (!len || wcspbrk(name, L"\\/*?\"<>|") || name[len - 1] == '.' || name[len - 1] == ' ') return FALSE;
++    for (i = 0; i < len; i++) if (name[i] < 0x20) return FALSE;
++    return TRUE;
++}
++
++WCHAR *macdlg_dos_path(const char *unix_path)
++{
++    const char *slash;
++    WCHAR *path, *leaf, *dir, *ret;
++    WIN32_FIND_DATAW data;
++    HANDLE find;
++    size_t dir_len;
++    int len;
++
++    if (!unix_path || !unix_path[0] || !(path = pwine_get_dos_file_name(unix_path))) return NULL;
++
++    /* A macOS name that Windows cannot use ("q?x.txt", "name. "): return the
++       8.3 name that Wine lists for the file, which Windows programs can open. */
++    if (!(slash = strrchr(unix_path, '/')) || !slash[1]) return path;
++    len = MultiByteToWideChar(CP_UTF8, 0, slash + 1, -1, NULL, 0);
++    if (!(leaf = malloc(len * sizeof(WCHAR)))) return path;
++    MultiByteToWideChar(CP_UTF8, 0, slash + 1, -1, leaf, len);
++    if (!is_windows_name(leaf) && wcsrchr(path, '\\'))
++    {
++        dir_len = wcsrchr(path, '\\') - path + 1;
++        if ((dir = malloc((dir_len + 2) * sizeof(WCHAR))))
++        {
++            memcpy(dir, path, dir_len * sizeof(WCHAR));
++            lstrcpyW(dir + dir_len, L"*");
++            if ((find = FindFirstFileW(dir, &data)) != INVALID_HANDLE_VALUE)
++            {
++                do
++                {
++                    if (wcscmp(data.cFileName, leaf) || !data.cAlternateFileName[0]) continue;
++                    if ((ret = HeapAlloc(GetProcessHeap(), 0,
++                                         (dir_len + wcslen(data.cAlternateFileName) + 1) * sizeof(WCHAR))))
++                    {
++                        memcpy(ret, path, dir_len * sizeof(WCHAR));
++                        lstrcpyW(ret + dir_len, data.cAlternateFileName);
++                        TRACE("%s -> %s\n", debugstr_a(unix_path), debugstr_w(ret));
++                        HeapFree(GetProcessHeap(), 0, path);
++                        path = ret;
++                    }
++                    break;
++                } while (FindNextFileW(find, &data));
++                FindClose(find);
++            }
++            free(dir);
++        }
++    }
++    free(leaf);
++    return path;
++}
++
++
++/**************************************************************************
++ * A small JSON writer for the request to winemac.drv.
++ */
++void macdlg_json_init(struct macdlg_json *json)
++{
++    memset(json, 0, sizeof(*json));
++}
++
++void macdlg_json_free(struct macdlg_json *json)
++{
++    free(json->data);
++    macdlg_json_init(json);
++}
++
++static void json_append(struct macdlg_json *json, const char *str, size_t len)
++{
++    if (json->len + len + 1 > json->size)
++    {
++        size_t size = max(json->size * 2, json->len + len + 256);
++        char *data = realloc(json->data, size);
++        if (!data) return;
++        json->data = data;
++        json->size = size;
++    }
++    memcpy(json->data + json->len, str, len);
++    json->len += len;
++    json->data[json->len] = 0;
++}
++
++static void json_escaped(struct macdlg_json *json, const char *str)
++{
++    char buf[8];
++
++    json_append(json, "\"", 1);
++    for (; *str; str++)
++    {
++        unsigned char c = *str;
++        if (c == '"' || c == '\\')
++        {
++            buf[0] = '\\';
++            buf[1] = c;
++            json_append(json, buf, 2);
++        }
++        else if (c < 0x20)
++        {
++            sprintf(buf, "\\u%04x", c);
++            json_append(json, buf, 6);
++        }
++        else json_append(json, (const char *)str, 1);
++    }
++    json_append(json, "\"", 1);
++}
++
++static void json_key(struct macdlg_json *json, const char *key)
++{
++    if (json->comma) json_append(json, ",", 1);
++    json->comma = TRUE;
++    if (!key) return;
++    json_escaped(json, key);
++    json_append(json, ":", 1);
++}
++
++void macdlg_json_open(struct macdlg_json *json, const char *key, char bracket)
++{
++    json_key(json, key);
++    json_append(json, &bracket, 1);
++    json->comma = FALSE;
++}
++
++void macdlg_json_close(struct macdlg_json *json, char bracket)
++{
++    json_append(json, &bracket, 1);
++    json->comma = TRUE;
++}
++
++void macdlg_json_utf8(struct macdlg_json *json, const char *key, const char *value)
++{
++    if (!value) return;
++    json_key(json, key);
++    json_escaped(json, value);
++}
++
++void macdlg_json_string(struct macdlg_json *json, const char *key, const WCHAR *value)
++{
++    char *utf8;
++    int len;
++
++    if (!value) return;
++    len = WideCharToMultiByte(CP_UTF8, 0, value, -1, NULL, 0, NULL, NULL);
++    if (!(utf8 = malloc(len))) return;
++    WideCharToMultiByte(CP_UTF8, 0, value, -1, utf8, len, NULL, NULL);
++    macdlg_json_utf8(json, key, utf8);
++    free(utf8);
++}
++
++void macdlg_json_int(struct macdlg_json *json, const char *key, LONGLONG value)
++{
++    char buf[32];
++
++    json_key(json, key);
++    sprintf(buf, "%I64d", value);
++    json_append(json, buf, strlen(buf));
++}
++
++void macdlg_json_bool(struct macdlg_json *json, const char *key, BOOL value)
++{
++    json_key(json, key);
++    json_append(json, value ? "true" : "false", value ? 4 : 5);
++}
++
++void macdlg_json_folder(struct macdlg_json *json, const WCHAR *dos_path)
++{
++    char *unix_path = macdlg_unix_path(dos_path);
++
++    macdlg_json_utf8(json, "directory", unix_path);
++    HeapFree(GetProcessHeap(), 0, unix_path);
++}
++
++/* One {"name":..., "patterns":[...]} entry; "*.prt; *.sldprt" gives two patterns. */
++void macdlg_json_filter(struct macdlg_json *json, const WCHAR *name, const WCHAR *spec)
++{
++    const WCHAR *start, *end;
++    WCHAR *pattern;
++    size_t len;
++
++    macdlg_json_open(json, NULL, '{');
++    macdlg_json_string(json, "name", name ? name : L"");
++    macdlg_json_open(json, "patterns", '[');
++    for (start = spec; start && *start; start = *end ? end + 1 : end)
++    {
++        while (*start == ' ') start++;
++        if (!(end = wcschr(start, ';'))) end = start + wcslen(start);
++        if (!(len = end - start)) continue;
++        if (!(pattern = malloc((len + 1) * sizeof(WCHAR)))) break;
++        memcpy(pattern, start, len * sizeof(WCHAR));
++        pattern[len] = 0;
++        while (len && pattern[len - 1] == ' ') pattern[--len] = 0;
++        if (len) macdlg_json_string(json, NULL, pattern);
++        free(pattern);
++    }
++    macdlg_json_close(json, ']');
++    macdlg_json_close(json, '}');
++}
++
++void macdlg_json_test(struct macdlg_json *json)
++{
++    WCHAR *response = get_env(L"MACSW_NATIVE_FILE_DIALOG_TEST");
++    WCHAR *delay, *type, *controls;
++
++    if (!response) return;
++    delay = get_env(L"MACSW_NATIVE_FILE_DIALOG_TEST_DELAY_MS");
++    type = get_env(L"MACSW_NATIVE_FILE_DIALOG_TEST_TYPE");
++    controls = get_env(L"MACSW_NATIVE_FILE_DIALOG_TEST_CONTROLS");
++
++    macdlg_json_open(json, "test", '{');
++    macdlg_json_string(json, "response", response);
++    if (delay) macdlg_json_int(json, "delayMs", wcstol(delay, NULL, 10));
++    if (type) macdlg_json_int(json, "type", wcstol(type, NULL, 10));
++    macdlg_json_string(json, "controls", controls);
++    macdlg_json_close(json, '}');
++
++    free(response);
++    free(delay);
++    free(type);
++    free(controls);
++}
++
++
++/**************************************************************************
++ * Session: start the panel, pump messages while polling, end it.
++ */
++/* Like DialogBox: the top-level owner is disabled while the dialog is up. */
++void macdlg_disable_owner(struct macdlg_owner *state, HWND owner)
++{
++    memset(state, 0, sizeof(*state));
++    state->active = GetActiveWindow();
++    state->focus = GetFocus();
++    if (owner) owner = GetAncestor(owner, GA_ROOT);
++    state->owner = owner;
++    if (!owner || !IsWindowEnabled(owner)) return;
++    EnableWindow(owner, FALSE);
++    state->disabled = owner;
++}
++
++/* Activation goes back to the owner if comdlg32 disabled it (as when a modal
++   dialog ends), otherwise to the window that was active, e.g. an outer modal
++   dialog that had disabled the owner itself; the focus goes back too. */
++void macdlg_restore_owner(struct macdlg_owner *state, BOOL activate)
++{
++    HWND active = state->disabled ? state->disabled : state->active;
++
++    if (state->disabled && IsWindow(state->disabled)) EnableWindow(state->disabled, TRUE);
++    if (!activate || !active || !IsWindow(active) ||
++        GetWindowThreadProcessId(active, NULL) != GetCurrentThreadId()) return;
++    SetActiveWindow(active);
++    if (state->focus && IsWindow(state->focus) && GetAncestor(state->focus, GA_ROOT) == GetActiveWindow())
++        SetFocus(state->focus);
++}
++
++BOOL macdlg_begin(struct macdlg_session *session, HWND owner, const struct macdlg_json *request)
++{
++    memset(session, 0, sizeof(*session));
++    if (!request->data) return FALSE;
++
++    /* The panel becomes a sheet of the owner's Cocoa window when it has one. */
++    if (owner) owner = GetAncestor(owner, GA_ROOT);
++    session->owner = owner;
++
++    TRACE("request %s\n", debugstr_a(request->data));
++    session->begin_time = GetTickCount();
++    session->dialog = pmacsw_file_dialog(MACDLG_BEGIN, 0, owner, request->data, request->len, NULL, 0, NULL);
++    if (session->dialog <= 0)
++    {
++        WARN("winemac.drv could not start the panel, using the Wine dialog\n");
++        session->dialog = 0;
++        return FALSE;
++    }
++    return TRUE;
++}
++
++static void unescape_field(char *field)
++{
++    char *src, *dst;
++
++    for (src = dst = field; *src; src++)
++    {
++        if (*src == '\\' && src[1])
++        {
++            src++;
++            switch (*src)
++            {
++            case 't': *dst++ = '\t'; break;
++            case 'n': *dst++ = '\n'; break;
++            case 'r': *dst++ = '\r'; break;
++            default:  *dst++ = *src; break;
++            }
++        }
++        else *dst++ = *src;
++    }
++    *dst = 0;
++}
++
++static void dispatch_lines(struct macdlg_session *session, char *data, macdlg_line_callback callback,
++                           void *context)
++{
++    char *line, *next, **argv = NULL;
++    int argc, capacity = 0;
++
++    for (line = data; line && *line; line = next)
++    {
++        char *field;
++
++        if ((next = strchr(line, '\n'))) *next++ = 0;
++        argc = 0;
++        for (field = line; field; )
++        {
++            char *tab = strchr(field, '\t');
++            if (tab) *tab++ = 0;
++            if (argc == capacity)
++            {
++                char **tmp = realloc(argv, (capacity = capacity * 2 + 8) * sizeof(*argv));
++                if (!tmp) goto done;
++                argv = tmp;
++            }
++            unescape_field(field);
++            argv[argc++] = field;
++            field = tab;
++        }
++        TRACE("line %s (%d fields)\n", debugstr_a(argv[0]), argc);
++        if (!strcmp(argv[0], "started")) session->started = TRUE;
++        else callback(context, argc, argv);
++    }
++done:
++    free(argv);
++}
++
++/* One round of the modal loop. Returns 0 while the panel is up, 1 once it has
++   ended, MACDLG_NOT_STARTED if it never came up (an exception in winemac.drv,
++   or no "started" line within 10 s), -1 on errors. */
++int macdlg_step(struct macdlg_session *session, macdlg_line_callback callback, void *context)
++{
++    UINT len = 0;
++    MSG msg;
++    int state;
++
++    MsgWaitForMultipleObjectsEx(0, NULL, 50, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
++    while (!session->quit && PeekMessageW(&msg, 0, 0, 0, PM_REMOVE))
++    {
++        if (msg.message == WM_QUIT)
++        {
++            /* Like a modal loop: end the dialog and re-post WM_QUIT afterwards. */
++            session->quit = TRUE;
++            session->quit_code = msg.wParam;
++            macdlg_cancel(session);
++            break;
++        }
++        TranslateMessage(&msg);
++        DispatchMessageW(&msg);
++    }
++    if (session->owner && !IsWindow(session->owner))
++    {
++        session->owner = NULL;
++        macdlg_cancel(session);
++    }
++
++    for (;;)
++    {
++        if (!session->buffer)
++        {
++            session->buffer_size = 64 * 1024;
++            if (!(session->buffer = malloc(session->buffer_size + 1))) return -1;
++        }
++        state = pmacsw_file_dialog(MACDLG_POLL, session->dialog, NULL, NULL, 0,
++                                   session->buffer, session->buffer_size, &len);
++        if (state != 2) break;
++        free(session->buffer);
++        session->buffer = NULL;
++        session->buffer_size = 0;
++        if (!(session->buffer = malloc(len + 1))) return -1;
++        session->buffer_size = len;
++    }
++    if (state < 0) return -1;
++
++    session->buffer[min(len, session->buffer_size)] = 0;
++    if (len) dispatch_lines(session, session->buffer, callback, context);
++
++    if (!session->started && !session->cancelled &&
++        (state == 1 || GetTickCount() - session->begin_time > 10000))
++    {
++        WARN("the panel did not start\n");
++        if (state != 1) macdlg_cancel(session);
++        return MACDLG_NOT_STARTED;
++    }
++    return state == 1;
++}
++
++void macdlg_update(struct macdlg_session *session, const struct macdlg_json *update)
++{
++    if (!session->dialog || !update->data) return;
++    TRACE("update %s\n", debugstr_a(update->data));
++    pmacsw_file_dialog(MACDLG_UPDATE, session->dialog, NULL, update->data, update->len, NULL, 0, NULL);
++}
++
++void macdlg_cancel(struct macdlg_session *session)
++{
++    session->cancelled = TRUE;
++    if (session->dialog) pmacsw_file_dialog(MACDLG_CANCEL, session->dialog, NULL, NULL, 0, NULL, 0, NULL);
++}
++
++void macdlg_end(struct macdlg_session *session)
++{
++    if (session->dialog) pmacsw_file_dialog(MACDLG_RELEASE, session->dialog, NULL, NULL, 0, NULL, 0, NULL);
++    session->dialog = 0;
++    if (session->quit) PostQuitMessage(session->quit_code);
++    free(session->buffer);
++    session->buffer = NULL;
++}
+diff --git a/dlls/comdlg32/macdlg.h b/dlls/comdlg32/macdlg.h
+new file mode 100644
+index 0000000..46b4e0c
+--- /dev/null
++++ b/dlls/comdlg32/macdlg.h
+@@ -0,0 +1,102 @@
++/*
++ * MacSW: macOS native file dialogs for comdlg32
++ *
++ * Copyright 2026 MacSW contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#ifndef _WINE_COMDLG32_MACDLG_H
++#define _WINE_COMDLG32_MACDLG_H
++
++/*
++ * With MACSW_NATIVE_FILE_DIALOGS=1 (and winemac.drv loaded) GetOpenFileName,
++ * GetSaveFileName and IFileDialog::Show use NSOpenPanel/NSSavePanel through
++ * winemac.drv's macsw_file_dialog export. Unset or any other value keeps the
++ * Wine dialogs. The panel is asynchronous; the calling thread keeps pumping
++ * its messages, with the owner disabled like a modal dialog.
++ *
++ * An IFileDialog whose program asks for the dialog window (IOleWindow) while
++ * the dialog opens keeps the Wine dialog: the program is about to put its own
++ * windows into it. MACSW_NATIVE_FILE_DIALOGS=all shows the panel there too.
++ *
++ * MACSW_NATIVE_FILE_DIALOG_TEST (automation only) ends every native panel by
++ * itself: "cancel", or a newline separated list of unix paths to return.
++ * MACSW_NATIVE_FILE_DIALOG_TEST_DELAY_MS keeps the real panel up that long
++ * first, _TEST_TYPE picks a 1-based "Format" entry and _TEST_CONTROLS sets
++ * accessory controls ("<control id>=<value>;..."), as if done by the user.
++ */
++
++struct macdlg_json
++{
++    char  *data;
++    size_t len;
++    size_t size;
++    BOOL   comma;
++};
++
++struct macdlg_session
++{
++    int    dialog;
++    HWND   owner;
++    BOOL   quit;
++    WPARAM quit_code;
++    BOOL   started;     /* the panel reported that it is on screen */
++    BOOL   cancelled;   /* comdlg32 asked the panel to end */
++    DWORD  begin_time;
++    char  *buffer;
++    UINT   buffer_size;
++};
++
++/* What the owner looked like before the panel (macdlg_disable_owner). */
++struct macdlg_owner
++{
++    HWND owner;
++    HWND disabled;
++    HWND active;
++    HWND focus;
++};
++
++/* macdlg_step: the panel did not come up; the caller may use the Wine dialog. */
++#define MACDLG_NOT_STARTED (-2)
++
++typedef void (*macdlg_line_callback)(void *context, int argc, char **argv);
++
++extern BOOL macdlg_enabled(void);
++extern BOOL macdlg_everywhere(void);
++extern char *macdlg_unix_path(const WCHAR *dos_path);
++extern WCHAR *macdlg_dos_path(const char *unix_path);
++
++extern void macdlg_json_init(struct macdlg_json *json);
++extern void macdlg_json_free(struct macdlg_json *json);
++extern void macdlg_json_open(struct macdlg_json *json, const char *key, char bracket);
++extern void macdlg_json_close(struct macdlg_json *json, char bracket);
++extern void macdlg_json_string(struct macdlg_json *json, const char *key, const WCHAR *value);
++extern void macdlg_json_utf8(struct macdlg_json *json, const char *key, const char *value);
++extern void macdlg_json_int(struct macdlg_json *json, const char *key, LONGLONG value);
++extern void macdlg_json_bool(struct macdlg_json *json, const char *key, BOOL value);
++extern void macdlg_json_folder(struct macdlg_json *json, const WCHAR *dos_path);
++extern void macdlg_json_filter(struct macdlg_json *json, const WCHAR *name, const WCHAR *spec);
++extern void macdlg_json_test(struct macdlg_json *json);
++
++extern void macdlg_disable_owner(struct macdlg_owner *state, HWND owner);
++extern void macdlg_restore_owner(struct macdlg_owner *state, BOOL activate);
++extern BOOL macdlg_begin(struct macdlg_session *session, HWND owner, const struct macdlg_json *request);
++extern int macdlg_step(struct macdlg_session *session, macdlg_line_callback callback, void *context);
++extern void macdlg_update(struct macdlg_session *session, const struct macdlg_json *update);
++extern void macdlg_cancel(struct macdlg_session *session);
++extern void macdlg_end(struct macdlg_session *session);
++
++#endif /* _WINE_COMDLG32_MACDLG_H */

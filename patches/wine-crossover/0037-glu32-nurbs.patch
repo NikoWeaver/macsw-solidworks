@@ -1,0 +1,2035 @@
+From: MacSW maintainers
+Subject: [PATCH] glu32: Implement the GLU 1.3 NURBS curves and surfaces.
+
+SOLIDWORKS ends with an "Assertion failed" box of the Wine C++ Runtime
+Library (dlls/glu32/glu.c) the first time it redraws a sketch that has a
+spline or an ellipse: gluNewNurbsRenderer returned NULL, every other NURBS
+function was assert(0), and SOLIDWORKS does not check for NULL.
+
+New dlls/glu32/nurbs.c, plain C:
+ * gluNewNurbsRenderer, gluDeleteNurbsRenderer, gluNurbsProperty and
+   gluGetNurbsProperty with the GLU 1.3 defaults (GLU_PATH_LENGTH, 50
+   pixels, 0.5, GLU_U_STEP and GLU_V_STEP 100, GLU_FILL, culling off,
+   GLU_AUTO_LOAD_MATRIX on, GLU_NURBS_RENDERER), gluLoadSamplingMatrices.
+ * gluNurbsCallback: GLU_NURBS_ERROR and the tessellator callbacks
+   GLU_NURBS_BEGIN/VERTEX/NORMAL/COLOR/TEXTURE_COORD/END and their _DATA
+   forms. glu32 does not export gluNurbsCallbackData, so the _DATA forms
+   get a NULL user pointer.
+ * Curves (gluBeginCurve, gluNurbsCurve, gluEndCurve): GL_MAP1_VERTEX_3,
+   GL_MAP1_VERTEX_4 (rational) and the normal, color, index and texture
+   maps. Surfaces (gluBeginSurface, gluNurbsSurface, gluEndSurface): the
+   same GL_MAP2 types; without a GL_MAP2_NORMAL map the normals are
+   computed (renderer: only with GL_AUTO_NORMAL, like evaluators).
+   Trimming (gluBeginTrim, gluPwlCurve, NURBS trim curves, gluEndTrim) is
+   approximate: grid vertices are kept by the winding number of the
+   sampled loops, so a trimmed edge is accurate to about one grid cell.
+ * Points come from de Boor's algorithm on each knot span. The steps per
+   span come from the sampling method (path length or parametric error in
+   pixels through the sampling matrices, the same in object space, or the
+   domain distance), at most 1024 per span and 65536 per curve, and 256
+   along each direction of a surface, so a tiny tolerance cannot make a
+   huge loop. Each span keeps at least one step, so a surface with very
+   many knot spans can still need a huge grid or trimming loop: when the
+   grid or all trimming loops together would need more than 256 MB, the
+   surface gives GLU_OUT_OF_MEMORY. These counts are checked before they
+   can overflow and before any memory is allocated for them.
+ * The renderer draws with glBegin/glVertex3fv (rational points are
+   divided by w), so it goes through the immediate-mode batching of patch
+   0030; evaluated colors, normals and texture coordinates do not change
+   the current ones (glPushAttrib(GL_CURRENT_BIT)).
+ * Invalid input goes to the error callback with GLU_NURBS_ERROR1-37,
+   GLU_INVALID_ENUM, GLU_INVALID_VALUE or GLU_OUT_OF_MEMORY and is not
+   drawn. Every entry point ignores a NULL object. Nothing asserts.
+ * TRACE on every entry point (WINEDEBUG=+glu).
+
+include/wine/glu.h gets the GLU 1.3 NURBS constants. dlls/glu32/tests
+check the tessellator callbacks. See docs/glu-nurbs.md.
+
+diff --git a/dlls/glu32/Makefile.in b/dlls/glu32/Makefile.in
+index bcec566..f7c5816 100644
+--- a/dlls/glu32/Makefile.in
++++ b/dlls/glu32/Makefile.in
+@@ -9,6 +9,7 @@ SOURCES = \
+ 	glu.c \
+ 	mesh.c \
+ 	mipmap.c \
++	nurbs.c \
+ 	priorityq.c \
+ 	project.c \
+ 	quad.c \
+diff --git a/dlls/glu32/glu.c b/dlls/glu32/glu.c
+index 8b045ea..5a8af94 100644
+--- a/dlls/glu32/glu.c
++++ b/dlls/glu32/glu.c
+@@ -17,7 +17,6 @@
+  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+  */
+ 
+-#include <assert.h>
+ #include <stdarg.h>
+ 
+ #include "windef.h"
+@@ -25,9 +24,6 @@
+ 
+ #include "wine/wgl.h"
+ #include "wine/glu.h"
+-#include "wine/debug.h"
+-
+-WINE_DEFAULT_DEBUG_CHANNEL(glu);
+ 
+ static const struct { GLuint err; const char *str; } errors[] =
+ {
+@@ -121,131 +117,6 @@ const WCHAR * WINAPI wine_gluErrorUnicodeStringEXT( GLenum errCode )
+     return NULL;
+ }
+ 
+-/***********************************************************************
+- *		gluNewNurbsRenderer (GLU32.@)
+- */
+-GLUnurbs * WINAPI wine_gluNewNurbsRenderer(void)
+-{
+-    ERR( "Nurbs renderer is not supported, please report\n" );
+-    return NULL;
+-}
+-
+-/***********************************************************************
+- *		gluDeleteNurbsRenderer (GLU32.@)
+- */
+-void WINAPI wine_gluDeleteNurbsRenderer( GLUnurbs *nobj )
+-{
+-    assert( 0 );
+-}
+-
+-/***********************************************************************
+- *		gluLoadSamplingMatrices (GLU32.@)
+- */
+-void WINAPI wine_gluLoadSamplingMatrices( GLUnurbs *nobj, const GLfloat modelMatrix[16],
+-                                          const GLfloat projMatrix[16], const GLint viewport[4] )
+-{
+-    assert( 0 );
+-}
+-
+-/***********************************************************************
+- *		gluNurbsProperty (GLU32.@)
+- */
+-void WINAPI wine_gluNurbsProperty( GLUnurbs *nobj, GLenum property, GLfloat value )
+-{
+-    assert( 0 );
+-}
+-
+-/***********************************************************************
+- *		gluGetNurbsProperty (GLU32.@)
+- */
+-void WINAPI wine_gluGetNurbsProperty( GLUnurbs *nobj, GLenum property, GLfloat *value )
+-{
+-    assert( 0 );
+-}
+-
+-/***********************************************************************
+- *		gluBeginCurve (GLU32.@)
+- */
+-void WINAPI wine_gluBeginCurve( GLUnurbs *nobj )
+-{
+-    assert( 0 );
+-}
+-
+-/***********************************************************************
+- *		gluEndCurve (GLU32.@)
+- */
+-void WINAPI wine_gluEndCurve( GLUnurbs *nobj )
+-{
+-    assert( 0 );
+-}
+-
+-/***********************************************************************
+- *		gluNurbsCurve (GLU32.@)
+- */
+-void WINAPI wine_gluNurbsCurve( GLUnurbs *nobj, GLint nknots, GLfloat *knot,
+-                                GLint stride, GLfloat *ctlarray, GLint order, GLenum type )
+-{
+-    assert( 0 );
+-}
+-
+-/***********************************************************************
+- *		gluBeginSurface (GLU32.@)
+- */
+-void WINAPI wine_gluBeginSurface( GLUnurbs *nobj )
+-{
+-    assert( 0 );
+-}
+-
+-/***********************************************************************
+- *		gluEndSurface (GLU32.@)
+- */
+-void WINAPI wine_gluEndSurface( GLUnurbs *nobj )
+-{
+-    assert( 0 );
+-}
+-
+-/***********************************************************************
+- *		gluNurbsSurface (GLU32.@)
+- */
+-void WINAPI wine_gluNurbsSurface( GLUnurbs *nobj, GLint sknot_count, float *sknot, GLint tknot_count,
+-                                  GLfloat *tknot, GLint s_stride, GLint t_stride, GLfloat *ctlarray,
+-                                  GLint sorder, GLint torder, GLenum type )
+-{
+-    assert( 0 );
+-}
+-
+-/***********************************************************************
+- *		gluBeginTrim (GLU32.@)
+- */
+-void WINAPI wine_gluBeginTrim( GLUnurbs *nobj )
+-{
+-    assert( 0 );
+-}
+-
+-/***********************************************************************
+- *		gluEndTrim (GLU32.@)
+- */
+-void WINAPI wine_gluEndTrim( GLUnurbs *nobj )
+-{
+-    assert( 0 );
+-}
+-
+-/***********************************************************************
+- *		gluPwlCurve (GLU32.@)
+- */
+-void WINAPI wine_gluPwlCurve( GLUnurbs *nobj, GLint count, GLfloat *array, GLint stride, GLenum type )
+-{
+-    assert( 0 );
+-}
+-
+-/***********************************************************************
+- *		gluNurbsCallback (GLU32.@)
+- */
+-void WINAPI wine_gluNurbsCallback( GLUnurbs *nobj, GLenum which, void (CALLBACK *fn)(void) )
+-{
+-    assert( 0 );
+-}
+-
+ /***********************************************************************
+  *		gluGetString (GLU32.@)
+  */
+diff --git a/dlls/glu32/nurbs.c b/dlls/glu32/nurbs.c
+new file mode 100644
+index 0000000..d890156
+--- /dev/null
++++ b/dlls/glu32/nurbs.c
+@@ -0,0 +1,1481 @@
++/*
++ * GLU 1.3 NURBS curves and surfaces
++ *
++ * Copyright 2026 MacSW maintainers
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++/*
++ * Curves and surfaces are evaluated with de Boor's algorithm, one knot span at a time, and put out
++ * as line strips, quad strips and triangles: with glBegin/glVertex in GLU_NURBS_RENDERER mode, or
++ * through the GLU_NURBS_BEGIN/VERTEX/NORMAL/COLOR/TEXTURE_COORD/END callbacks in
++ * GLU_NURBS_TESSELLATOR mode. The sampling method gives the number of steps per knot span, and the
++ * MAX_*_STEPS limits keep a tiny tolerance from making a huge loop. A surface grid, or the trimming
++ * loops of a surface, that would need more than MAX_FLOATS floats give GLU_OUT_OF_MEMORY.
++ *
++ * Trimming is approximate. The trimming loops are sampled in the (s, t) domain. A grid vertex is
++ * kept when its winding number is positive (a counterclockwise loop keeps its inside, a clockwise
++ * loop cuts a hole; when no loop is counterclockwise, the whole domain is the outer boundary). A
++ * grid cell is drawn when at least three of its corners are kept, so a trimmed edge is accurate to
++ * about one grid cell.
++ */
++
++#include <math.h>
++#include <stdarg.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "windef.h"
++#include "winbase.h"
++#include "wine/wgl.h"
++#include "wine/glu.h"
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(glu);
++
++#define MAX_ORDER        24     /* highest order (degree + 1), as in the SGI sample implementation */
++#define MAX_SPAN_STEPS   1024   /* line segments per knot span of a curve */
++#define MAX_CURVE_STEPS  65536  /* line segments per curve (at least one per knot span) */
++#define MAX_GRID_STEPS   256    /* grid steps along s or t of a surface (at least one per knot span) */
++#define MAX_TRIM_STEPS   256    /* line segments per knot span of a trimming curve */
++#define BEHIND_EYE_STEPS 64     /* steps for a knot span with a control point behind the eye */
++#define MAX_FLOATS       (1 << 26)  /* largest copy of control points (256 MB), largest surface grid */
++
++enum { SLOT_VERTEX, SLOT_NORMAL, SLOT_COLOR, SLOT_TEXTURE, SLOT_COUNT };
++enum nurbs_state { STATE_NONE, STATE_CURVE, STATE_SURFACE, STATE_TRIM };
++
++static const struct
++{
++    GLenum curve, surface;
++    int dim, slot;
++}
++map_types[] =
++{
++    { GL_MAP1_VERTEX_3, GL_MAP2_VERTEX_3, 3, SLOT_VERTEX },
++    { GL_MAP1_VERTEX_4, GL_MAP2_VERTEX_4, 4, SLOT_VERTEX },
++    { GL_MAP1_NORMAL, GL_MAP2_NORMAL, 3, SLOT_NORMAL },
++    { GL_MAP1_COLOR_4, GL_MAP2_COLOR_4, 4, SLOT_COLOR },
++    { GL_MAP1_INDEX, GL_MAP2_INDEX, 1, SLOT_COLOR },
++    { GL_MAP1_TEXTURE_COORD_1, GL_MAP2_TEXTURE_COORD_1, 1, SLOT_TEXTURE },
++    { GL_MAP1_TEXTURE_COORD_2, GL_MAP2_TEXTURE_COORD_2, 2, SLOT_TEXTURE },
++    { GL_MAP1_TEXTURE_COORD_3, GL_MAP2_TEXTURE_COORD_3, 3, SLOT_TEXTURE },
++    { GL_MAP1_TEXTURE_COORD_4, GL_MAP2_TEXTURE_COORD_4, 4, SLOT_TEXTURE },
++};
++
++/* one curve (knots[1] == NULL, count[1] == 1) or surface, with copies of its knots and points */
++struct nurbs_map
++{
++    GLenum type;          /* 0: not set */
++    int dim;              /* floats per control point */
++    int order[2];         /* along s (the curve parameter) and t */
++    int count[2];         /* control points along s and t */
++    GLfloat *knots[2];    /* count + order knots each */
++    GLfloat *ctl;         /* point (i, j) at ctl[(i * count[1] + j) * dim] */
++};
++
++/* one piece of a trimming loop: a NURBS curve, or a piecewise linear curve */
++struct trim_piece
++{
++    struct trim_piece *next;
++    struct nurbs_map map;   /* map.type is 0 for a piecewise linear curve */
++    int npoints;
++    GLfloat *points;        /* (s, t) pairs of a piecewise linear curve */
++};
++
++struct trim_loop
++{
++    struct trim_loop *next;
++    struct trim_piece *pieces, **tail;
++    int npoints;            /* the sampled loop, made in gluEndSurface */
++    GLfloat *points;
++};
++
++struct GLUnurbs
++{
++    enum nurbs_state state;
++    GLenum sampling_method, display_mode, mode;
++    GLfloat sampling_tolerance, parametric_tolerance, u_step, v_step;
++    GLboolean culling, auto_load;
++    GLfloat model[16], proj[16];
++    GLint viewport[4];
++    struct nurbs_map maps[SLOT_COUNT];
++    struct trim_loop *loops;
++    void (CALLBACK *error)( GLenum );
++    void (CALLBACK *begin)( GLenum );
++    void (CALLBACK *vertex)( GLfloat * );
++    void (CALLBACK *normal)( GLfloat * );
++    void (CALLBACK *color)( GLfloat * );
++    void (CALLBACK *texcoord)( GLfloat * );
++    void (CALLBACK *end)( void );
++    /* the _DATA forms get a NULL user pointer: glu32 does not export gluNurbsCallbackData */
++    void (CALLBACK *begin_data)( GLenum, void * );
++    void (CALLBACK *vertex_data)( GLfloat *, void * );
++    void (CALLBACK *normal_data)( GLfloat *, void * );
++    void (CALLBACK *color_data)( GLfloat *, void * );
++    void (CALLBACK *texcoord_data)( GLfloat *, void * );
++    void (CALLBACK *end_data)( void * );
++};
++
++struct sampler
++{
++    GLenum method;
++    GLfloat tolerance;
++    GLfloat steps[2];       /* GLU_U_STEP and GLU_V_STEP */
++    GLfloat matrix[16];     /* projection * modelview */
++    GLfloat half_width, half_height;
++};
++
++/* what is put out with each vertex */
++struct vertex_format
++{
++    int dim;                /* of the vertex map: 3 or 4 */
++    GLenum color;           /* type of the color map, or 0 */
++    int tex_dim;            /* of the texture map, or 0 */
++    BOOL normal;            /* a normal map, or computed normals (surfaces) */
++    BOOL compute_normal;
++};
++
++struct nurbs_vertex
++{
++    GLfloat pos[4], normal[3], color[4], tex[4];
++};
++
++struct crossing
++{
++    GLfloat s;
++    int dir;
++};
++
++static void *nurbs_alloc( size_t size )
++{
++    return HeapAlloc( GetProcessHeap(), 0, size );
++}
++
++static void nurbs_free( void *ptr )
++{
++    HeapFree( GetProcessHeap(), 0, ptr );
++}
++
++static void nurbs_error( GLUnurbs *nurbs, GLenum code )
++{
++    WARN( "%p: error %u\n", nurbs, code );
++    if (nurbs->error) nurbs->error( code );
++}
++
++/* checks one knot vector like the GLU_NURBS_ERROR1-5 descriptions; returns 0 or the error */
++static GLenum check_knots( GLint nknots, const GLfloat *knots, GLint order )
++{
++    GLint i, mult = 1;
++
++    if (order < 1 || order > MAX_ORDER) return GLU_NURBS_ERROR1;
++    if (nknots < 2 * order) return GLU_NURBS_ERROR2;
++    if (!knots) return GLU_NURBS_ERROR32;
++    for (i = 0; i < nknots - 1; i++)
++    {
++        if (!(knots[i] <= knots[i + 1])) return GLU_NURBS_ERROR4;  /* also a NaN */
++        if (knots[i] < knots[i + 1]) mult = 1;
++        else if (++mult > order) return GLU_NURBS_ERROR5;
++    }
++    if (!isfinite( knots[0] ) || !isfinite( knots[nknots - 1] )) return GLU_NURBS_ERROR32;
++    if (!(knots[order - 1] < knots[nknots - order])) return GLU_NURBS_ERROR3;
++    return 0;
++}
++
++static void free_map( struct nurbs_map *map )
++{
++    nurbs_free( map->knots[0] );
++    nurbs_free( map->knots[1] );
++    nurbs_free( map->ctl );
++    memset( map, 0, sizeof(*map) );
++}
++
++/* checks and copies a curve (dirs == 1) or a surface (dirs == 2); returns 0 or the error */
++static GLenum copy_map( struct nurbs_map *map, GLenum type, int dim, int dirs, const GLint *nknots,
++                        GLfloat * const *knots, const GLint *stride, const GLint *order,
++                        const GLfloat *ctl )
++{
++    double floats = dim;
++    size_t i, j;
++    GLenum err;
++    int d;
++
++    memset( map, 0, sizeof(*map) );
++    for (d = 0; d < dirs; d++)
++    {
++        if ((err = check_knots( nknots[d], knots[d], order[d] ))) return err;
++        if (stride[d] < 0) return GLU_NURBS_ERROR34;
++        floats *= nknots[d] - order[d];
++    }
++    if (!ctl) return GLU_NURBS_ERROR36;
++    if (floats > MAX_FLOATS) return GLU_OUT_OF_MEMORY;
++
++    map->type = type;
++    map->dim = dim;
++    map->order[1] = map->count[1] = 1;
++    for (d = 0; d < dirs; d++)
++    {
++        map->order[d] = order[d];
++        map->count[d] = nknots[d] - order[d];
++        if (!(map->knots[d] = nurbs_alloc( nknots[d] * sizeof(GLfloat) ))) goto oom;
++        memcpy( map->knots[d], knots[d], nknots[d] * sizeof(GLfloat) );
++    }
++    if (!(map->ctl = nurbs_alloc( (size_t)floats * sizeof(GLfloat) ))) goto oom;
++    for (i = 0; i < map->count[0]; i++)
++        for (j = 0; j < map->count[1]; j++)
++            memcpy( map->ctl + (i * map->count[1] + j) * dim,
++                    ctl + i * stride[0] + (dirs > 1 ? j * stride[1] : 0), dim * sizeof(GLfloat) );
++    return 0;
++
++oom:
++    free_map( map );
++    return GLU_OUT_OF_MEMORY;
++}
++
++/* knot span of u: knots[span] <= u < knots[span + 1], the last span for the end of the range;
++ * u is clamped to the valid range [knots[order - 1], knots[count]] */
++static int find_span( const GLfloat *knots, int order, int count, GLfloat *u )
++{
++    int lo = order - 1, hi = count, mid;
++
++    if (*u >= knots[hi])
++    {
++        *u = knots[hi];
++        for (lo = hi - 1; knots[lo] == knots[hi]; lo--) ;
++        return lo;
++    }
++    if (!(*u > knots[lo])) *u = knots[lo];  /* also a NaN */
++    while (hi - lo > 1)
++    {
++        mid = (lo + hi) / 2;
++        if (knots[mid] <= *u) lo = mid;
++        else hi = mid;
++    }
++    return lo;
++}
++
++/* de Boor's algorithm on the knot span "span" (knots[span] <= u <= knots[span + 1]). pts holds the
++ * control points span - order + 1 ... span (dim floats each) and is overwritten. The point goes to
++ * out, and the first derivative to deriv when it is not NULL. */
++static void de_boor( const GLfloat *knots, int span, int order, int dim, GLfloat u, GLfloat *pts,
++                     GLfloat *out, GLfloat *deriv )
++{
++    int p = order - 1, r, k, c, j;
++    GLfloat a, scale;
++
++    if (!p && deriv) memset( deriv, 0, dim * sizeof(GLfloat) );
++    for (r = 1; r <= p; r++)
++    {
++        if (r == p && deriv)
++        {
++            scale = p / (knots[span + 1] - knots[span]);
++            for (c = 0; c < dim; c++) deriv[c] = scale * (pts[p * dim + c] - pts[(p - 1) * dim + c]);
++        }
++        for (k = p; k >= r; k--)
++        {
++            j = span - p + k;
++            a = (u - knots[j]) / (knots[j + p + 1 - r] - knots[j]);
++            for (c = 0; c < dim; c++)
++                pts[k * dim + c] = (1 - a) * pts[(k - 1) * dim + c] + a * pts[k * dim + c];
++        }
++    }
++    memcpy( out, pts + p * dim, dim * sizeof(GLfloat) );
++}
++
++/* a curve point on a known knot span */
++static void eval_curve_span( const struct nurbs_map *map, int span, GLfloat u, GLfloat *out, GLfloat *deriv )
++{
++    GLfloat pts[MAX_ORDER * 4];
++    int order = map->order[0];
++
++    memcpy( pts, map->ctl + (size_t)(span - order + 1) * map->dim, order * map->dim * sizeof(GLfloat) );
++    de_boor( map->knots[0], span, order, map->dim, u, pts, out, deriv );
++}
++
++/* a curve point (t is not used) or a surface point, with the derivatives along s and t */
++static void eval_map( const struct nurbs_map *map, GLfloat s, GLfloat t, GLfloat *out, GLfloat *ds, GLfloat *dt )
++{
++    GLfloat rows[MAX_ORDER * 4], drows[MAX_ORDER * 4], pts[MAX_ORDER * 4];
++    int so = map->order[0], to = map->order[1], dim = map->dim, ss, ts, i;
++
++    ss = find_span( map->knots[0], so, map->count[0], &s );
++    if (!map->knots[1])
++    {
++        eval_curve_span( map, ss, s, out, ds );
++        return;
++    }
++    ts = find_span( map->knots[1], to, map->count[1], &t );
++    for (i = 0; i < so; i++)
++    {
++        memcpy( pts, map->ctl + ((size_t)(ss - so + 1 + i) * map->count[1] + ts - to + 1) * dim,
++                to * dim * sizeof(GLfloat) );
++        de_boor( map->knots[1], ts, to, dim, t, pts, rows + i * dim, dt ? drows + i * dim : NULL );
++    }
++    if (dt) de_boor( map->knots[0], ss, so, dim, s, drows, dt, NULL );
++    de_boor( map->knots[0], ss, so, dim, s, rows, out, ds );
++}
++
++static void init_sampler( GLUnurbs *nurbs, struct sampler *smp )
++{
++    int r, c, k;
++
++    smp->method = nurbs->sampling_method;
++    if (smp->method == GLU_PATH_LENGTH || smp->method == GLU_OBJECT_PATH_LENGTH)
++        smp->tolerance = nurbs->sampling_tolerance;
++    else
++        smp->tolerance = nurbs->parametric_tolerance;
++    smp->steps[0] = nurbs->u_step;
++    smp->steps[1] = nurbs->v_step;
++    if (nurbs->auto_load && (nurbs->culling || smp->method == GLU_PATH_LENGTH ||
++                             smp->method == GLU_PARAMETRIC_ERROR))
++    {
++        glGetFloatv( GL_MODELVIEW_MATRIX, nurbs->model );
++        glGetFloatv( GL_PROJECTION_MATRIX, nurbs->proj );
++        glGetIntegerv( GL_VIEWPORT, nurbs->viewport );
++    }
++    for (c = 0; c < 4; c++)
++        for (r = 0; r < 4; r++)
++            for (smp->matrix[c * 4 + r] = 0, k = 0; k < 4; k++)
++                smp->matrix[c * 4 + r] += nurbs->proj[k * 4 + r] * nurbs->model[c * 4 + k];
++    smp->half_width = nurbs->viewport[2] / 2.0f;
++    smp->half_height = nurbs->viewport[3] / 2.0f;
++}
++
++static void clip_point( const struct sampler *smp, const GLfloat *p, int dim, GLfloat *clip )
++{
++    GLfloat w = dim == 4 ? p[3] : 1.0f;
++    int r;
++
++    for (r = 0; r < 4; r++)
++        clip[r] = smp->matrix[r] * p[0] + smp->matrix[4 + r] * p[1] + smp->matrix[8 + r] * p[2] +
++                  smp->matrix[12 + r] * w;
++}
++
++/* a control point where the tolerance is measured: in window pixels or in object coordinates;
++ * FALSE when it has no such position (behind the eye, or at infinity) */
++static BOOL measure_point( const struct sampler *smp, const GLfloat *p, int dim, GLfloat *out )
++{
++    GLfloat w = dim == 4 ? p[3] : 1.0f, clip[4];
++
++    if (smp->method == GLU_OBJECT_PATH_LENGTH || smp->method == GLU_OBJECT_PARAMETRIC_ERROR)
++    {
++        if (w == 0.0f) return FALSE;
++        out[0] = p[0] / w;
++        out[1] = p[1] / w;
++        out[2] = p[2] / w;
++        return TRUE;
++    }
++    clip_point( smp, p, dim, clip );
++    if (!(clip[3] > 0.0f)) return FALSE;
++    out[0] = clip[0] / clip[3] * smp->half_width;
++    out[1] = clip[1] / clip[3] * smp->half_height;
++    out[2] = 0.0f;
++    return TRUE;
++}
++
++static GLfloat point_distance( const GLfloat *a, const GLfloat *b )
++{
++    return sqrtf( (a[0] - b[0]) * (a[0] - b[0]) + (a[1] - b[1]) * (a[1] - b[1]) + (a[2] - b[2]) * (a[2] - b[2]) );
++}
++
++static int clamp_steps( float n, int limit )
++{
++    if (!(n >= 1.0f)) return 1;  /* also a NaN */
++    if (n >= limit) return limit;
++    return ceilf( n );
++}
++
++/* steps for one knot span of length range along dir, from its order control points (stride
++ * floats apart): path length / tolerance, or sqrt(d (d - 1) |second difference| / (8 tolerance))
++ * for a parametric error, or range * GLU_U_STEP (GLU_V_STEP) for the domain distance */
++static int span_steps( const struct sampler *smp, int dir, const GLfloat *pts, size_t stride, int order,
++                       int dim, GLfloat range )
++{
++    GLfloat q[MAX_ORDER][3], d[3], length = 0.0f, bend = 0.0f, b;
++    int i, c;
++
++    if (smp->method == GLU_DOMAIN_DISTANCE) return clamp_steps( range * smp->steps[dir], MAX_SPAN_STEPS );
++    for (i = 0; i < order; i++)
++        if (!measure_point( smp, pts + i * stride, dim, q[i] )) return BEHIND_EYE_STEPS;
++    if (smp->method == GLU_PATH_LENGTH || smp->method == GLU_OBJECT_PATH_LENGTH)
++    {
++        for (i = 1; i < order; i++) length += point_distance( q[i - 1], q[i] );
++        return clamp_steps( length / smp->tolerance, MAX_SPAN_STEPS );
++    }
++    for (i = 2; i < order; i++)
++    {
++        for (c = 0; c < 3; c++) d[c] = q[i][c] - 2 * q[i - 1][c] + q[i - 2][c];
++        b = sqrtf( d[0] * d[0] + d[1] * d[1] + d[2] * d[2] );
++        if (b > bend) bend = b;
++    }
++    return clamp_steps( sqrtf( (order - 1) * (order - 2) * bend / (8 * smp->tolerance) ), MAX_SPAN_STEPS );
++}
++
++/* GLU_CULLING: TRUE when every control point is outside the same clip plane */
++static BOOL culled( const struct sampler *smp, const struct nurbs_map *map )
++{
++    size_t i, n = (size_t)map->count[0] * map->count[1];
++    GLfloat clip[4];
++    int outside = 0x3f, flags;
++
++    for (i = 0; i < n && outside; i++)
++    {
++        clip_point( smp, map->ctl + i * map->dim, map->dim, clip );
++        flags = 0;
++        if (clip[0] < -clip[3]) flags |= 0x01;
++        if (clip[0] > clip[3]) flags |= 0x02;
++        if (clip[1] < -clip[3]) flags |= 0x04;
++        if (clip[1] > clip[3]) flags |= 0x08;
++        if (clip[2] < -clip[3]) flags |= 0x10;
++        if (clip[2] > clip[3]) flags |= 0x20;
++        outside &= flags;
++    }
++    return outside != 0;
++}
++
++static void out_begin( GLUnurbs *nurbs, GLenum mode )
++{
++    if (nurbs->mode == GLU_NURBS_RENDERER) glBegin( mode );
++    else if (nurbs->begin_data) nurbs->begin_data( mode, NULL );
++    else if (nurbs->begin) nurbs->begin( mode );
++}
++
++static void out_end( GLUnurbs *nurbs )
++{
++    if (nurbs->mode == GLU_NURBS_RENDERER) glEnd();
++    else if (nurbs->end_data) nurbs->end_data( NULL );
++    else if (nurbs->end) nurbs->end();
++}
++
++static void out_vertex( GLUnurbs *nurbs, const struct vertex_format *fmt, const struct nurbs_vertex *v )
++{
++    GLfloat pos[4], normal[3], color[4], tex[4], w = fmt->dim == 4 ? v->pos[3] : 1.0f;
++
++    memcpy( pos, v->pos, sizeof(pos) );
++    memcpy( normal, v->normal, sizeof(normal) );
++    memcpy( color, v->color, sizeof(color) );
++    memcpy( tex, v->tex, sizeof(tex) );
++    if (w != 1.0f && w != 0.0f)  /* a point at infinity (w == 0) keeps its direction */
++    {
++        pos[0] /= w;
++        pos[1] /= w;
++        pos[2] /= w;
++    }
++    if (nurbs->mode == GLU_NURBS_RENDERER)
++    {
++        if (fmt->color == GL_MAP1_INDEX || fmt->color == GL_MAP2_INDEX) glIndexf( color[0] );
++        else if (fmt->color) glColor4fv( color );
++        if (fmt->normal) glNormal3fv( normal );
++        switch (fmt->tex_dim)
++        {
++        case 1: glTexCoord1fv( tex ); break;
++        case 2: glTexCoord2fv( tex ); break;
++        case 3: glTexCoord3fv( tex ); break;
++        case 4: glTexCoord4fv( tex ); break;
++        }
++        if (w != 0.0f) glVertex3fv( pos );
++        else glVertex4fv( v->pos );
++        return;
++    }
++    if (fmt->color)
++    {
++        if (nurbs->color_data) nurbs->color_data( color, NULL );
++        else if (nurbs->color) nurbs->color( color );
++    }
++    if (fmt->normal)
++    {
++        if (nurbs->normal_data) nurbs->normal_data( normal, NULL );
++        else if (nurbs->normal) nurbs->normal( normal );
++    }
++    if (fmt->tex_dim)
++    {
++        if (nurbs->texcoord_data) nurbs->texcoord_data( tex, NULL );
++        else if (nurbs->texcoord) nurbs->texcoord( tex );
++    }
++    if (nurbs->vertex_data) nurbs->vertex_data( pos, NULL );
++    else if (nurbs->vertex) nurbs->vertex( pos );
++}
++
++static void init_format( GLUnurbs *nurbs, struct vertex_format *fmt, BOOL surface )
++{
++    fmt->dim = nurbs->maps[SLOT_VERTEX].dim;
++    fmt->color = nurbs->maps[SLOT_COLOR].type;
++    fmt->tex_dim = nurbs->maps[SLOT_TEXTURE].dim;
++    fmt->compute_normal = FALSE;
++    if (!nurbs->maps[SLOT_NORMAL].type && surface)
++    {
++        /* like GL_AUTO_NORMAL for evaluators; the tessellator always computes them */
++        if (nurbs->mode == GLU_NURBS_RENDERER) fmt->compute_normal = glIsEnabled( GL_AUTO_NORMAL );
++        else fmt->compute_normal = nurbs->normal || nurbs->normal_data;
++    }
++    fmt->normal = nurbs->maps[SLOT_NORMAL].type || fmt->compute_normal;
++    /* evaluated colors, normals and texture coordinates do not change the current ones */
++    if (nurbs->mode == GLU_NURBS_RENDERER && (fmt->color || fmt->normal || fmt->tex_dim))
++        glPushAttrib( GL_CURRENT_BIT );
++}
++
++static void done_format( GLUnurbs *nurbs, const struct vertex_format *fmt )
++{
++    if (nurbs->mode == GLU_NURBS_RENDERER && (fmt->color || fmt->normal || fmt->tex_dim))
++        glPopAttrib();
++}
++
++/* evaluates the attribute maps of a vertex at (s, t) */
++static void eval_attributes( GLUnurbs *nurbs, const struct vertex_format *fmt, GLfloat s, GLfloat t,
++                             struct nurbs_vertex *v )
++{
++    GLfloat len;
++
++    if (nurbs->maps[SLOT_NORMAL].type)
++    {
++        eval_map( &nurbs->maps[SLOT_NORMAL], s, t, v->normal, NULL, NULL );
++        len = sqrtf( v->normal[0] * v->normal[0] + v->normal[1] * v->normal[1] + v->normal[2] * v->normal[2] );
++        if (len > 0.0f && isfinite( len ))
++        {
++            v->normal[0] /= len;
++            v->normal[1] /= len;
++            v->normal[2] /= len;
++        }
++    }
++    if (fmt->color) eval_map( &nurbs->maps[SLOT_COLOR], s, t, v->color, NULL, NULL );
++    if (fmt->tex_dim) eval_map( &nurbs->maps[SLOT_TEXTURE], s, t, v->tex, NULL, NULL );
++}
++
++static void surface_vertex( GLUnurbs *nurbs, const struct vertex_format *fmt, GLfloat s, GLfloat t,
++                            struct nurbs_vertex *v, GLfloat *last_normal )
++{
++    const struct nurbs_map *map = &nurbs->maps[SLOT_VERTEX];
++    GLfloat ds[4], dt[4], a[3], b[3], n[3], len;
++    int c;
++
++    memset( v, 0, sizeof(*v) );
++    v->pos[3] = 1.0f;
++    v->color[3] = 1.0f;
++    v->tex[3] = 1.0f;
++    if (!fmt->compute_normal)
++    {
++        eval_map( map, s, t, v->pos, NULL, NULL );
++        eval_attributes( nurbs, fmt, s, t, v );
++        return;
++    }
++    eval_map( map, s, t, v->pos, ds, dt );
++    for (c = 0; c < 3; c++)  /* rational: w^2 times the derivatives of the projected point */
++    {
++        a[c] = map->dim == 4 ? ds[c] * v->pos[3] - ds[3] * v->pos[c] : ds[c];
++        b[c] = map->dim == 4 ? dt[c] * v->pos[3] - dt[3] * v->pos[c] : dt[c];
++    }
++    n[0] = a[1] * b[2] - a[2] * b[1];
++    n[1] = a[2] * b[0] - a[0] * b[2];
++    n[2] = a[0] * b[1] - a[1] * b[0];
++    len = sqrtf( n[0] * n[0] + n[1] * n[1] + n[2] * n[2] );
++    if (len > 0.0f && isfinite( len ))  /* a degenerate point (a pole) keeps the last normal */
++    {
++        last_normal[0] = n[0] / len;
++        last_normal[1] = n[1] / len;
++        last_normal[2] = n[2] / len;
++    }
++    memcpy( v->normal, last_normal, 3 * sizeof(GLfloat) );
++    eval_attributes( nurbs, fmt, s, t, v );
++}
++
++static int knot_multiplicity( const GLfloat *knots, int index )
++{
++    int i = index;
++
++    while (i > 0 && knots[i - 1] == knots[index]) i--;
++    return index - i + 1;
++}
++
++static void draw_curve( GLUnurbs *nurbs )
++{
++    const struct nurbs_map *map = &nurbs->maps[SLOT_VERTEX];
++    struct vertex_format fmt;
++    struct nurbs_vertex v;
++    struct sampler smp;
++    int span, order = map->order[0], steps, i, total = 0;
++    GLfloat u0, u1, u, scale = 1.0f;
++    double wanted = 0.0;
++    BOOL open = FALSE;
++
++    if (!map->type)
++    {
++        nurbs_error( nurbs, GLU_NURBS_ERROR8 );
++        return;
++    }
++    init_sampler( nurbs, &smp );
++    if (nurbs->culling && culled( &smp, map )) return;
++    /* first pass: the steps of the whole curve, scaled down when there are more than MAX_CURVE_STEPS */
++    for (span = order - 1; span < map->count[0]; span++)
++    {
++        u0 = map->knots[0][span];
++        u1 = map->knots[0][span + 1];
++        if (u0 < u1) wanted += span_steps( &smp, 0, map->ctl + (size_t)(span - order + 1) * map->dim, map->dim,
++                                           order, map->dim, u1 - u0 );
++    }
++    if (wanted > MAX_CURVE_STEPS) scale = MAX_CURVE_STEPS / wanted;
++    init_format( nurbs, &fmt, FALSE );
++    for (span = order - 1; span < map->count[0]; span++)
++    {
++        u0 = map->knots[0][span];
++        u1 = map->knots[0][span + 1];
++        if (!(u0 < u1)) continue;
++        /* the curve can jump at a knot of full multiplicity: start a new strip there */
++        if (open && knot_multiplicity( map->knots[0], span ) >= order)
++        {
++            out_end( nurbs );
++            open = FALSE;
++        }
++        steps = span_steps( &smp, 0, map->ctl + (size_t)(span - order + 1) * map->dim, map->dim, order,
++                            map->dim, u1 - u0 );
++        if (scale < 1.0f) steps = max( 1, (int)(steps * scale) );
++        i = open ? 1 : 0;
++        if (!open) out_begin( nurbs, GL_LINE_STRIP );
++        open = TRUE;
++        for (; i <= steps; i++)
++        {
++            u = i == steps ? u1 : u0 + (u1 - u0) * i / steps;
++            memset( &v, 0, sizeof(v) );
++            v.pos[3] = v.color[3] = v.tex[3] = 1.0f;
++            eval_curve_span( map, span, u, v.pos, NULL );
++            eval_attributes( nurbs, &fmt, u, 0.0f, &v );
++            out_vertex( nurbs, &fmt, &v );
++        }
++        total += steps;
++    }
++    if (open) out_end( nurbs );
++    done_format( nurbs, &fmt );
++    TRACE( "%p: %d segments\n", nurbs, total );
++}
++
++/* the parameter values of the grid along dir, at least one step per knot span; NULL if out of memory,
++ * or if there are more values than vertices fit in the largest grid (see draw_surface) */
++static GLfloat *grid_params( const struct sampler *smp, const struct nurbs_map *map, int dir, int *count )
++{
++    const GLfloat *knots = map->knots[dir];
++    int order = map->order[dir], n = map->count[dir], other = map->count[!dir];
++    size_t stride = dir ? map->dim : (size_t)map->count[1] * map->dim;
++    size_t row = dir ? (size_t)map->count[1] * map->dim : map->dim;
++    int span, j, i, k = 0, total = 0, s, *steps;
++    double wanted = 0.0;  /* a double: many knot spans of MAX_SPAN_STEPS each can pass INT_MAX */
++    GLfloat *params, range;
++
++    if (!(steps = nurbs_alloc( n * sizeof(int) ))) return NULL;
++    for (span = order - 1; span < n; span++)
++    {
++        steps[span] = 0;
++        range = knots[span + 1] - knots[span];
++        if (!(range > 0.0f)) continue;
++        for (j = 0; j < other; j++)
++        {
++            s = span_steps( smp, dir, map->ctl + (span - order + 1) * stride + j * row, stride, order,
++                            map->dim, range );
++            if (s > steps[span]) steps[span] = s;
++            if (smp->method == GLU_DOMAIN_DISTANCE) break;
++        }
++        wanted += steps[span];
++    }
++    for (span = order - 1; span < n; span++)
++    {
++        if (!steps[span]) continue;
++        if (wanted > MAX_GRID_STEPS)
++            steps[span] = max( 1, (int)((double)steps[span] * MAX_GRID_STEPS / wanted) );
++        total += steps[span];
++        /* checked on each span, so total stays far below INT_MAX */
++        if ((size_t)total + 1 > MAX_FLOATS * sizeof(GLfloat) / sizeof(struct nurbs_vertex))
++        {
++            nurbs_free( steps );
++            return NULL;
++        }
++    }
++    if (!(params = nurbs_alloc( ((size_t)total + 1) * sizeof(GLfloat) )))
++    {
++        nurbs_free( steps );
++        return NULL;
++    }
++    for (span = order - 1; span < n; span++)
++    {
++        if (!steps[span]) continue;
++        for (i = k ? 1 : 0; i <= steps[span]; i++)
++            params[k++] = i == steps[span] ? knots[span + 1] :
++                          knots[span] + (knots[span + 1] - knots[span]) * i / steps[span];
++    }
++    nurbs_free( steps );
++    *count = k;
++    return params;
++}
++
++/* samples every trimming loop into an (s, t) polyline, with steps about "step" long; FALSE if out of
++ * memory, or if all loops together have more than MAX_FLOATS / 2 points (the gluPwlCurve limit) */
++static BOOL sample_trims( GLUnurbs *nurbs, GLfloat step )
++{
++    struct trim_loop *loop;
++    struct trim_piece *piece;
++    const struct nurbs_map *map;
++    GLfloat p[3], q[MAX_ORDER][2], length, u0, u1, u;
++    int span, steps, i, k, n, total = 0;
++
++    for (loop = nurbs->loops; loop; loop = loop->next)
++    {
++        /* first pass counts the points (total + n stays <= MAX_FLOATS / 2), second pass stores them */
++        for (k = 0; k < 2; k++)
++        {
++            n = 0;
++            for (piece = loop->pieces; piece; piece = piece->next)
++            {
++                if (!(map = &piece->map)->type)
++                {
++                    if (!k && piece->npoints > MAX_FLOATS / 2 - total - n) return FALSE;
++                    if (k) memcpy( loop->points + 2 * n, piece->points, piece->npoints * 2 * sizeof(GLfloat) );
++                    n += piece->npoints;
++                    continue;
++                }
++                for (span = map->order[0] - 1; span < map->count[0]; span++)
++                {
++                    u0 = map->knots[0][span];
++                    u1 = map->knots[0][span + 1];
++                    if (!(u0 < u1)) continue;
++                    for (i = 0, length = 0.0f; i < map->order[0]; i++)
++                    {
++                        const GLfloat *c = map->ctl + (size_t)(span - map->order[0] + 1 + i) * map->dim;
++                        GLfloat w = map->dim == 3 ? c[2] : 1.0f;
++                        q[i][0] = c[0] / w;
++                        q[i][1] = c[1] / w;
++                        if (i) length += sqrtf( (q[i][0] - q[i - 1][0]) * (q[i][0] - q[i - 1][0]) +
++                                                (q[i][1] - q[i - 1][1]) * (q[i][1] - q[i - 1][1]) );
++                    }
++                    steps = clamp_steps( length / step, MAX_TRIM_STEPS );
++                    if (!k)
++                    {
++                        if (steps + 1 > MAX_FLOATS / 2 - total - n) return FALSE;
++                        n += steps + 1;
++                        continue;
++                    }
++                    for (i = 0; i <= steps; i++, n++)
++                    {
++                        u = i == steps ? u1 : u0 + (u1 - u0) * i / steps;
++                        eval_curve_span( map, span, u, p, NULL );
++                        if (map->dim == 3 && p[2] != 0.0f)
++                        {
++                            p[0] /= p[2];
++                            p[1] /= p[2];
++                        }
++                        loop->points[2 * n] = p[0];
++                        loop->points[2 * n + 1] = p[1];
++                    }
++                }
++            }
++            if (!k)
++            {
++                nurbs_free( loop->points );
++                loop->npoints = 0;
++                if (!(loop->points = nurbs_alloc( max( n, 1 ) * 2 * sizeof(GLfloat) ))) return FALSE;
++            }
++        }
++        loop->npoints = n;
++        total += n;
++    }
++    return TRUE;
++}
++
++static int __cdecl compare_crossings( const void *a, const void *b )
++{
++    const struct crossing *x = a, *y = b;
++
++    return x->s < y->s ? -1 : x->s > y->s ? 1 : 0;
++}
++
++/* which grid vertices the trimming loops keep (scan line per grid row); NULL if out of memory */
++static BYTE *trim_mask( GLUnurbs *nurbs, const GLfloat *sp, int ns, const GLfloat *tp, int nt )
++{
++    const struct trim_loop *loop;
++    struct crossing *crossings;
++    const GLfloat *a, *b;
++    size_t segments = 0;
++    int i, j, k, n, wind, base = 1;
++    GLfloat area, t, s;
++    BYTE *mask;
++
++    for (loop = nurbs->loops; loop; loop = loop->next)
++    {
++        segments += loop->npoints;
++        for (k = 0, area = 0.0f; k < loop->npoints; k++)
++        {
++            a = loop->points + 2 * k;
++            b = loop->points + 2 * ((k + 1) % loop->npoints);
++            area += a[0] * b[1] - b[0] * a[1];
++        }
++        if (area > 0.0f) base = 0;  /* a counterclockwise loop is an outer boundary */
++    }
++    if (!(mask = nurbs_alloc( (size_t)ns * nt ))) return NULL;
++    if (!(crossings = nurbs_alloc( max( segments, 1 ) * sizeof(*crossings) )))
++    {
++        nurbs_free( mask );
++        return NULL;
++    }
++    for (j = 0; j < nt; j++)
++    {
++        t = tp[j];
++        n = wind = 0;
++        for (loop = nurbs->loops; loop; loop = loop->next)
++        {
++            for (k = 0; k < loop->npoints; k++)
++            {
++                a = loop->points + 2 * k;
++                b = loop->points + 2 * ((k + 1) % loop->npoints);
++                if ((a[1] <= t) == (b[1] <= t)) continue;
++                s = a[0] + (t - a[1]) * (b[0] - a[0]) / (b[1] - a[1]);
++                if (isnan( s )) continue;
++                crossings[n].s = s;
++                crossings[n].dir = b[1] > a[1] ? 1 : -1;  /* upward edges count on the right of a point */
++                wind += crossings[n++].dir;
++            }
++        }
++        qsort( crossings, n, sizeof(*crossings), compare_crossings );
++        for (i = k = 0; i < ns; i++)
++        {
++            while (k < n && crossings[k].s <= sp[i]) wind -= crossings[k++].dir;
++            mask[j * ns + i] = base + wind > 0;
++        }
++    }
++    nurbs_free( crossings );
++    return mask;
++}
++
++#define KEPT(i, j) (!mask || mask[(j) * ns + (i)])
++
++static void draw_grid_fill( GLUnurbs *nurbs, const struct vertex_format *fmt, const struct nurbs_vertex *grid,
++                            const BYTE *mask, int ns, int nt )
++{
++    const struct nurbs_vertex *row0, *row1, *quad[4], *tri[3];
++    int i, j, k, start = 0, kept, triangles;
++
++    for (j = 0; j + 1 < nt; j++)
++    {
++        row0 = grid + j * ns;
++        row1 = row0 + ns;
++        /* quad strips over the columns that are kept in both rows, like glEvalMesh2 */
++        for (i = 0; i < ns; i = max( i, start + 1 ))
++        {
++            for (start = i; i < ns && KEPT( i, j ) && KEPT( i, j + 1 ); i++) ;
++            if (i - start < 2) continue;
++            out_begin( nurbs, GL_QUAD_STRIP );
++            for (k = start; k < i; k++)
++            {
++                out_vertex( nurbs, fmt, row0 + k );
++                out_vertex( nurbs, fmt, row1 + k );
++            }
++            out_end( nurbs );
++        }
++        if (!mask) continue;
++        /* a cell with three kept corners is a triangle, in the winding order of the quads */
++        for (i = triangles = 0; i + 1 < ns; i++)
++        {
++            quad[0] = KEPT( i, j ) ? row0 + i : NULL;
++            quad[1] = KEPT( i, j + 1 ) ? row1 + i : NULL;
++            quad[2] = KEPT( i + 1, j + 1 ) ? row1 + i + 1 : NULL;
++            quad[3] = KEPT( i + 1, j ) ? row0 + i + 1 : NULL;
++            for (k = kept = 0; k < 4; k++)
++            {
++                if (!quad[k]) continue;
++                if (kept < 3) tri[kept] = quad[k];
++                kept++;
++            }
++            if (kept != 3) continue;
++            if (!triangles++) out_begin( nurbs, GL_TRIANGLES );
++            for (k = 0; k < 3; k++) out_vertex( nurbs, fmt, tri[k] );
++        }
++        if (triangles) out_end( nurbs );
++    }
++}
++
++/* line strips along the grid rows (dir 0) or columns (dir 1), broken where a vertex is trimmed away */
++static void draw_grid_lines( GLUnurbs *nurbs, const struct vertex_format *fmt, const struct nurbs_vertex *grid,
++                             const BYTE *mask, int ns, int nt, int dir )
++{
++    int a, b, start = 0, na = dir ? ns : nt, nb = dir ? nt : ns, k;
++
++    for (a = 0; a < na; a++)
++    {
++        for (b = 0; b < nb; b = max( b, start + 1 ))
++        {
++            for (start = b; b < nb && (dir ? KEPT( a, b ) : KEPT( b, a )); b++) ;
++            if (b - start < 2) continue;
++            out_begin( nurbs, GL_LINE_STRIP );
++            for (k = start; k < b; k++) out_vertex( nurbs, fmt, dir ? grid + k * ns + a : grid + a * ns + k );
++            out_end( nurbs );
++        }
++    }
++}
++
++static void draw_outline_patch( GLUnurbs *nurbs, const struct vertex_format *fmt, const struct nurbs_vertex *grid,
++                                int ns, int nt, GLfloat *last_normal )
++{
++    const struct trim_loop *loop;
++    struct nurbs_vertex v;
++    int i;
++
++    if (!nurbs->loops)
++    {
++        out_begin( nurbs, GL_LINE_STRIP );
++        for (i = 0; i < ns; i++) out_vertex( nurbs, fmt, grid + i );
++        for (i = 1; i < nt; i++) out_vertex( nurbs, fmt, grid + i * ns + ns - 1 );
++        for (i = ns - 2; i >= 0; i--) out_vertex( nurbs, fmt, grid + (nt - 1) * ns + i );
++        for (i = nt - 2; i >= 0; i--) out_vertex( nurbs, fmt, grid + i * ns );
++        out_end( nurbs );
++        return;
++    }
++    for (loop = nurbs->loops; loop; loop = loop->next)
++    {
++        if (!loop->npoints) continue;
++        out_begin( nurbs, GL_LINE_STRIP );
++        for (i = 0; i <= loop->npoints; i++)
++        {
++            const GLfloat *p = loop->points + 2 * (i % loop->npoints);
++            surface_vertex( nurbs, fmt, p[0], p[1], &v, last_normal );
++            out_vertex( nurbs, fmt, &v );
++        }
++        out_end( nurbs );
++    }
++}
++
++static void draw_surface( GLUnurbs *nurbs )
++{
++    const struct nurbs_map *map = &nurbs->maps[SLOT_VERTEX];
++    GLfloat *sp = NULL, *tp = NULL, last_normal[3] = { 0.0f, 0.0f, 1.0f }, step;
++    struct nurbs_vertex *grid = NULL;
++    struct vertex_format fmt;
++    struct sampler smp;
++    BYTE *mask = NULL;
++    int ns = 0, nt = 0, i, j;
++
++    if (!map->type)
++    {
++        nurbs_error( nurbs, GLU_NURBS_ERROR8 );
++        return;
++    }
++    init_sampler( nurbs, &smp );
++    if (nurbs->culling && culled( &smp, map )) return;
++    if (!(sp = grid_params( &smp, map, 0, &ns )) || !(tp = grid_params( &smp, map, 1, &nt ))) goto oom;
++    if ((double)ns * nt * sizeof(*grid) > (double)MAX_FLOATS * sizeof(GLfloat)) goto oom;
++    if (nurbs->loops)
++    {
++        step = 0.5f * min( (sp[ns - 1] - sp[0]) / (ns - 1), (tp[nt - 1] - tp[0]) / (nt - 1) );
++        if (!sample_trims( nurbs, step ) || !(mask = trim_mask( nurbs, sp, ns, tp, nt ))) goto oom;
++    }
++    if (!(grid = nurbs_alloc( (size_t)ns * nt * sizeof(*grid) ))) goto oom;
++
++    init_format( nurbs, &fmt, TRUE );
++    for (j = 0; j < nt; j++)
++        for (i = 0; i < ns; i++)
++            surface_vertex( nurbs, &fmt, sp[i], tp[j], grid + j * ns + i, last_normal );
++    switch (nurbs->display_mode)
++    {
++    case GLU_OUTLINE_POLYGON:
++        draw_grid_lines( nurbs, &fmt, grid, mask, ns, nt, 0 );
++        draw_grid_lines( nurbs, &fmt, grid, mask, ns, nt, 1 );
++        break;
++    case GLU_OUTLINE_PATCH:
++        draw_outline_patch( nurbs, &fmt, grid, ns, nt, last_normal );
++        break;
++    default:
++        draw_grid_fill( nurbs, &fmt, grid, mask, ns, nt );
++        break;
++    }
++    done_format( nurbs, &fmt );
++    TRACE( "%p: %d x %d grid%s\n", nurbs, ns, nt, mask ? ", trimmed" : "" );
++    goto done;
++
++oom:
++    nurbs_error( nurbs, GLU_OUT_OF_MEMORY );
++done:
++    nurbs_free( grid );
++    nurbs_free( mask );
++    nurbs_free( tp );
++    nurbs_free( sp );
++}
++
++static void free_trims( GLUnurbs *nurbs )
++{
++    struct trim_loop *loop;
++    struct trim_piece *piece;
++
++    while ((loop = nurbs->loops))
++    {
++        nurbs->loops = loop->next;
++        while ((piece = loop->pieces))
++        {
++            loop->pieces = piece->next;
++            free_map( &piece->map );
++            nurbs_free( piece->points );
++            nurbs_free( piece );
++        }
++        nurbs_free( loop->points );
++        nurbs_free( loop );
++    }
++}
++
++static void clear_maps( GLUnurbs *nurbs )
++{
++    int i;
++
++    for (i = 0; i < SLOT_COUNT; i++) free_map( &nurbs->maps[i] );
++}
++
++/* adds a piece to the trimming loop that gluBeginTrim started */
++static struct trim_piece *add_trim_piece( GLUnurbs *nurbs )
++{
++    struct trim_piece *piece;
++
++    if (!(piece = HeapAlloc( GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*piece) )))
++    {
++        nurbs_error( nurbs, GLU_OUT_OF_MEMORY );
++        return NULL;
++    }
++    *nurbs->loops->tail = piece;
++    nurbs->loops->tail = &piece->next;
++    return piece;
++}
++
++/***********************************************************************
++ *		gluNewNurbsRenderer (GLU32.@)
++ */
++GLUnurbs * WINAPI wine_gluNewNurbsRenderer(void)
++{
++    GLUnurbs *nurbs;
++    int i;
++
++    if (!(nurbs = HeapAlloc( GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*nurbs) ))) return NULL;
++    nurbs->sampling_method = GLU_PATH_LENGTH;
++    nurbs->sampling_tolerance = 50.0f;
++    nurbs->parametric_tolerance = 0.5f;
++    nurbs->u_step = nurbs->v_step = 100.0f;
++    nurbs->display_mode = GLU_FILL;
++    nurbs->culling = GL_FALSE;
++    nurbs->auto_load = GL_TRUE;
++    nurbs->mode = GLU_NURBS_RENDERER;
++    for (i = 0; i < 4; i++) nurbs->model[i * 5] = nurbs->proj[i * 5] = 1.0f;
++    nurbs->viewport[2] = nurbs->viewport[3] = 1;
++    TRACE( "() -> %p\n", nurbs );
++    return nurbs;
++}
++
++/***********************************************************************
++ *		gluDeleteNurbsRenderer (GLU32.@)
++ */
++void WINAPI wine_gluDeleteNurbsRenderer( GLUnurbs *nurbs )
++{
++    TRACE( "(%p)\n", nurbs );
++    if (!nurbs) return;
++    clear_maps( nurbs );
++    free_trims( nurbs );
++    nurbs_free( nurbs );
++}
++
++/***********************************************************************
++ *		gluLoadSamplingMatrices (GLU32.@)
++ */
++void WINAPI wine_gluLoadSamplingMatrices( GLUnurbs *nurbs, const GLfloat modelMatrix[16],
++                                          const GLfloat projMatrix[16], const GLint viewport[4] )
++{
++    TRACE( "(%p, %p, %p, %p)\n", nurbs, modelMatrix, projMatrix, viewport );
++    if (!nurbs) return;
++    if (modelMatrix) memcpy( nurbs->model, modelMatrix, sizeof(nurbs->model) );
++    if (projMatrix) memcpy( nurbs->proj, projMatrix, sizeof(nurbs->proj) );
++    if (viewport) memcpy( nurbs->viewport, viewport, sizeof(nurbs->viewport) );
++}
++
++/***********************************************************************
++ *		gluNurbsProperty (GLU32.@)
++ */
++void WINAPI wine_gluNurbsProperty( GLUnurbs *nurbs, GLenum property, GLfloat value )
++{
++    TRACE( "(%p, %u, %f)\n", nurbs, property, value );
++    if (!nurbs) return;
++
++    switch (property)
++    {
++    case GLU_SAMPLING_METHOD:
++        if (value != GLU_PATH_LENGTH && value != GLU_PARAMETRIC_ERROR && value != GLU_DOMAIN_DISTANCE &&
++            value != GLU_OBJECT_PATH_LENGTH && value != GLU_OBJECT_PARAMETRIC_ERROR) break;
++        nurbs->sampling_method = value;
++        return;
++    case GLU_SAMPLING_TOLERANCE:
++        if (!(value > 0.0f)) break;
++        nurbs->sampling_tolerance = value;
++        return;
++    case GLU_PARAMETRIC_TOLERANCE:
++        if (!(value > 0.0f)) break;
++        nurbs->parametric_tolerance = value;
++        return;
++    case GLU_U_STEP:
++        if (!(value > 0.0f)) break;
++        nurbs->u_step = value;
++        return;
++    case GLU_V_STEP:
++        if (!(value > 0.0f)) break;
++        nurbs->v_step = value;
++        return;
++    case GLU_DISPLAY_MODE:
++        if (value != GLU_FILL && value != GLU_OUTLINE_POLYGON && value != GLU_OUTLINE_PATCH) break;
++        nurbs->display_mode = value;
++        return;
++    case GLU_CULLING:
++        nurbs->culling = value != 0.0f;
++        return;
++    case GLU_AUTO_LOAD_MATRIX:
++        nurbs->auto_load = value != 0.0f;
++        return;
++    case GLU_NURBS_MODE:
++        if (value != GLU_NURBS_RENDERER && value != GLU_NURBS_TESSELLATOR) break;
++        nurbs->mode = value;
++        return;
++    default:
++        nurbs_error( nurbs, GLU_INVALID_ENUM );
++        return;
++    }
++    nurbs_error( nurbs, GLU_INVALID_VALUE );
++}
++
++/***********************************************************************
++ *		gluGetNurbsProperty (GLU32.@)
++ */
++void WINAPI wine_gluGetNurbsProperty( GLUnurbs *nurbs, GLenum property, GLfloat *value )
++{
++    TRACE( "(%p, %u, %p)\n", nurbs, property, value );
++    if (!nurbs || !value) return;
++
++    switch (property)
++    {
++    case GLU_SAMPLING_METHOD: *value = nurbs->sampling_method; break;
++    case GLU_SAMPLING_TOLERANCE: *value = nurbs->sampling_tolerance; break;
++    case GLU_PARAMETRIC_TOLERANCE: *value = nurbs->parametric_tolerance; break;
++    case GLU_U_STEP: *value = nurbs->u_step; break;
++    case GLU_V_STEP: *value = nurbs->v_step; break;
++    case GLU_DISPLAY_MODE: *value = nurbs->display_mode; break;
++    case GLU_CULLING: *value = nurbs->culling; break;
++    case GLU_AUTO_LOAD_MATRIX: *value = nurbs->auto_load; break;
++    case GLU_NURBS_MODE: *value = nurbs->mode; break;
++    default: nurbs_error( nurbs, GLU_INVALID_ENUM ); break;
++    }
++}
++
++/***********************************************************************
++ *		gluNurbsCallback (GLU32.@)
++ */
++void WINAPI wine_gluNurbsCallback( GLUnurbs *nurbs, GLenum which, void (CALLBACK *fn)(void) )
++{
++    TRACE( "(%p, %u, %p)\n", nurbs, which, fn );
++    if (!nurbs) return;
++
++    switch (which)
++    {
++    case GLU_NURBS_ERROR: nurbs->error = (void (CALLBACK *)(GLenum))fn; break;
++    case GLU_NURBS_BEGIN: nurbs->begin = (void (CALLBACK *)(GLenum))fn; break;
++    case GLU_NURBS_VERTEX: nurbs->vertex = (void (CALLBACK *)(GLfloat *))fn; break;
++    case GLU_NURBS_NORMAL: nurbs->normal = (void (CALLBACK *)(GLfloat *))fn; break;
++    case GLU_NURBS_COLOR: nurbs->color = (void (CALLBACK *)(GLfloat *))fn; break;
++    case GLU_NURBS_TEXTURE_COORD: nurbs->texcoord = (void (CALLBACK *)(GLfloat *))fn; break;
++    case GLU_NURBS_END: nurbs->end = (void (CALLBACK *)(void))fn; break;
++    case GLU_NURBS_BEGIN_DATA: nurbs->begin_data = (void (CALLBACK *)(GLenum, void *))fn; break;
++    case GLU_NURBS_VERTEX_DATA: nurbs->vertex_data = (void (CALLBACK *)(GLfloat *, void *))fn; break;
++    case GLU_NURBS_NORMAL_DATA: nurbs->normal_data = (void (CALLBACK *)(GLfloat *, void *))fn; break;
++    case GLU_NURBS_COLOR_DATA: nurbs->color_data = (void (CALLBACK *)(GLfloat *, void *))fn; break;
++    case GLU_NURBS_TEXTURE_COORD_DATA: nurbs->texcoord_data = (void (CALLBACK *)(GLfloat *, void *))fn; break;
++    case GLU_NURBS_END_DATA: nurbs->end_data = (void (CALLBACK *)(void *))fn; break;
++    default: nurbs_error( nurbs, GLU_INVALID_ENUM ); break;
++    }
++}
++
++/***********************************************************************
++ *		gluBeginCurve (GLU32.@)
++ */
++void WINAPI wine_gluBeginCurve( GLUnurbs *nurbs )
++{
++    TRACE( "(%p)\n", nurbs );
++    if (!nurbs) return;
++    if (nurbs->state != STATE_NONE)
++    {
++        nurbs_error( nurbs, nurbs->state == STATE_CURVE ? GLU_NURBS_ERROR6 : GLU_NURBS_ERROR27 );
++        return;
++    }
++    clear_maps( nurbs );
++    nurbs->state = STATE_CURVE;
++}
++
++/***********************************************************************
++ *		gluEndCurve (GLU32.@)
++ */
++void WINAPI wine_gluEndCurve( GLUnurbs *nurbs )
++{
++    TRACE( "(%p)\n", nurbs );
++    if (!nurbs) return;
++    if (nurbs->state != STATE_CURVE)
++    {
++        nurbs_error( nurbs, GLU_NURBS_ERROR7 );
++        return;
++    }
++    draw_curve( nurbs );
++    clear_maps( nurbs );
++    nurbs->state = STATE_NONE;
++}
++
++/***********************************************************************
++ *		gluNurbsCurve (GLU32.@)
++ */
++void WINAPI wine_gluNurbsCurve( GLUnurbs *nurbs, GLint nknots, GLfloat *knot,
++                                GLint stride, GLfloat *ctlarray, GLint order, GLenum type )
++{
++    struct trim_piece *piece;
++    struct nurbs_map map;
++    GLenum err;
++    int i;
++
++    TRACE( "(%p, %d, %p, %d, %p, %d, %#x)\n", nurbs, nknots, knot, stride, ctlarray, order, type );
++    if (!nurbs) return;
++
++    if (type == GLU_MAP1_TRIM_2 || type == GLU_MAP1_TRIM_3)
++    {
++        if (nurbs->state != STATE_TRIM)
++        {
++            nurbs_error( nurbs, GLU_NURBS_ERROR22 );
++            return;
++        }
++        if ((err = copy_map( &map, type, type == GLU_MAP1_TRIM_2 ? 2 : 3, 1, &nknots, &knot, &stride,
++                             &order, ctlarray )))
++        {
++            nurbs_error( nurbs, err );
++            return;
++        }
++        if (!(piece = add_trim_piece( nurbs ))) free_map( &map );
++        else piece->map = map;
++        return;
++    }
++
++    for (i = 0; i < ARRAY_SIZE(map_types); i++) if (map_types[i].curve == type) break;
++    if (i == ARRAY_SIZE(map_types))
++    {
++        nurbs_error( nurbs, nurbs->state == STATE_TRIM ? GLU_NURBS_ERROR14 : GLU_NURBS_ERROR35 );
++        return;
++    }
++    if (nurbs->state == STATE_TRIM)
++    {
++        nurbs_error( nurbs, GLU_NURBS_ERROR14 );
++        return;
++    }
++    if (nurbs->state == STATE_SURFACE)
++    {
++        nurbs_error( nurbs, GLU_NURBS_ERROR8 );
++        return;
++    }
++    if ((err = copy_map( &map, type, map_types[i].dim, 1, &nknots, &knot, &stride, &order, ctlarray )))
++    {
++        nurbs_error( nurbs, err );
++        return;
++    }
++    free_map( &nurbs->maps[map_types[i].slot] );
++    nurbs->maps[map_types[i].slot] = map;
++    if (nurbs->state == STATE_NONE)  /* outside gluBeginCurve/gluEndCurve: draw it now */
++    {
++        draw_curve( nurbs );
++        clear_maps( nurbs );
++    }
++}
++
++/***********************************************************************
++ *		gluBeginSurface (GLU32.@)
++ */
++void WINAPI wine_gluBeginSurface( GLUnurbs *nurbs )
++{
++    TRACE( "(%p)\n", nurbs );
++    if (!nurbs) return;
++    if (nurbs->state != STATE_NONE)
++    {
++        nurbs_error( nurbs, nurbs->state == STATE_CURVE ? GLU_NURBS_ERROR6 : GLU_NURBS_ERROR27 );
++        return;
++    }
++    clear_maps( nurbs );
++    free_trims( nurbs );
++    nurbs->state = STATE_SURFACE;
++}
++
++/***********************************************************************
++ *		gluEndSurface (GLU32.@)
++ */
++void WINAPI wine_gluEndSurface( GLUnurbs *nurbs )
++{
++    TRACE( "(%p)\n", nurbs );
++    if (!nurbs) return;
++    if (nurbs->state == STATE_TRIM)
++    {
++        nurbs_error( nurbs, GLU_NURBS_ERROR12 );
++        nurbs->state = STATE_SURFACE;
++    }
++    if (nurbs->state != STATE_SURFACE)
++    {
++        nurbs_error( nurbs, GLU_NURBS_ERROR13 );
++        return;
++    }
++    draw_surface( nurbs );
++    clear_maps( nurbs );
++    free_trims( nurbs );
++    nurbs->state = STATE_NONE;
++}
++
++/***********************************************************************
++ *		gluNurbsSurface (GLU32.@)
++ */
++void WINAPI wine_gluNurbsSurface( GLUnurbs *nurbs, GLint sknot_count, float *sknot, GLint tknot_count,
++                                  GLfloat *tknot, GLint s_stride, GLint t_stride, GLfloat *ctlarray,
++                                  GLint sorder, GLint torder, GLenum type )
++{
++    GLint nknots[2] = { sknot_count, tknot_count }, stride[2] = { s_stride, t_stride }, order[2] = { sorder, torder };
++    GLfloat *knots[2] = { sknot, tknot };
++    struct nurbs_map map;
++    GLenum err;
++    int i;
++
++    TRACE( "(%p, %d, %p, %d, %p, %d, %d, %p, %d, %d, %#x)\n", nurbs, sknot_count, sknot, tknot_count,
++           tknot, s_stride, t_stride, ctlarray, sorder, torder, type );
++    if (!nurbs) return;
++
++    for (i = 0; i < ARRAY_SIZE(map_types); i++) if (map_types[i].surface == type) break;
++    if (i == ARRAY_SIZE(map_types))
++    {
++        nurbs_error( nurbs, GLU_NURBS_ERROR35 );
++        return;
++    }
++    if (nurbs->state == STATE_CURVE || nurbs->state == STATE_TRIM)
++    {
++        nurbs_error( nurbs, GLU_NURBS_ERROR8 );
++        return;
++    }
++    if ((err = copy_map( &map, type, map_types[i].dim, 2, nknots, knots, stride, order, ctlarray )))
++    {
++        nurbs_error( nurbs, err );
++        return;
++    }
++    free_map( &nurbs->maps[map_types[i].slot] );
++    nurbs->maps[map_types[i].slot] = map;
++    if (nurbs->state == STATE_NONE)  /* outside gluBeginSurface/gluEndSurface: draw it now */
++    {
++        draw_surface( nurbs );
++        clear_maps( nurbs );
++    }
++}
++
++/***********************************************************************
++ *		gluBeginTrim (GLU32.@)
++ */
++void WINAPI wine_gluBeginTrim( GLUnurbs *nurbs )
++{
++    struct trim_loop *loop;
++
++    TRACE( "(%p)\n", nurbs );
++    if (!nurbs) return;
++    if (nurbs->state != STATE_SURFACE)
++    {
++        nurbs_error( nurbs, nurbs->state == STATE_TRIM ? GLU_NURBS_ERROR16 : GLU_NURBS_ERROR15 );
++        return;
++    }
++    if (!(loop = HeapAlloc( GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*loop) )))
++    {
++        nurbs_error( nurbs, GLU_OUT_OF_MEMORY );
++        return;
++    }
++    loop->tail = &loop->pieces;
++    loop->next = nurbs->loops;
++    nurbs->loops = loop;
++    nurbs->state = STATE_TRIM;
++}
++
++/***********************************************************************
++ *		gluEndTrim (GLU32.@)
++ */
++void WINAPI wine_gluEndTrim( GLUnurbs *nurbs )
++{
++    TRACE( "(%p)\n", nurbs );
++    if (!nurbs) return;
++    if (nurbs->state != STATE_TRIM)
++    {
++        nurbs_error( nurbs, GLU_NURBS_ERROR17 );
++        return;
++    }
++    nurbs->state = STATE_SURFACE;
++}
++
++/***********************************************************************
++ *		gluPwlCurve (GLU32.@)
++ */
++void WINAPI wine_gluPwlCurve( GLUnurbs *nurbs, GLint count, GLfloat *array, GLint stride, GLenum type )
++{
++    struct trim_piece *piece;
++    const GLfloat *p;
++    int i;
++
++    TRACE( "(%p, %d, %p, %d, %#x)\n", nurbs, count, array, stride, type );
++    if (!nurbs) return;
++
++    if (nurbs->state != STATE_TRIM)
++    {
++        nurbs_error( nurbs, GLU_NURBS_ERROR19 );
++        return;
++    }
++    if (type != GLU_MAP1_TRIM_2 && type != GLU_MAP1_TRIM_3)
++    {
++        nurbs_error( nurbs, GLU_NURBS_ERROR14 );
++        return;
++    }
++    if (count < 0)
++    {
++        nurbs_error( nurbs, GLU_NURBS_ERROR33 );
++        return;
++    }
++    if (stride < 0)
++    {
++        nurbs_error( nurbs, GLU_NURBS_ERROR34 );
++        return;
++    }
++    if (!array)
++    {
++        nurbs_error( nurbs, GLU_NURBS_ERROR36 );
++        return;
++    }
++    if (count > MAX_FLOATS / 2)
++    {
++        nurbs_error( nurbs, GLU_OUT_OF_MEMORY );
++        return;
++    }
++    if (!(piece = add_trim_piece( nurbs ))) return;
++    if (!(piece->points = nurbs_alloc( max( count, 1 ) * 2 * sizeof(GLfloat) )))
++    {
++        nurbs_error( nurbs, GLU_OUT_OF_MEMORY );
++        return;
++    }
++    for (i = 0; i < count; i++)
++    {
++        p = array + (size_t)i * stride;
++        if (type == GLU_MAP1_TRIM_3 && p[2] != 0.0f)
++        {
++            piece->points[2 * i] = p[0] / p[2];
++            piece->points[2 * i + 1] = p[1] / p[2];
++        }
++        else
++        {
++            piece->points[2 * i] = p[0];
++            piece->points[2 * i + 1] = p[1];
++        }
++    }
++    piece->npoints = count;
++}
+diff --git a/dlls/glu32/tests/glu.c b/dlls/glu32/tests/glu.c
+index 16607a9..a6cbd1f 100644
+--- a/dlls/glu32/tests/glu.c
++++ b/dlls/glu32/tests/glu.c
+@@ -18,6 +18,7 @@
+  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+  */
+ 
++#include <math.h>
+ #include <windows.h>
+ #include "wine/test.h"
+ #include "wine/wgl.h"
+@@ -87,6 +88,273 @@ static void test_gluScaleImage(HDC hdc, HGLRC hglrc)
+     ok(!memcmp(bufout, expect, SIZEOUT), "miscompare\n");
+ }
+ 
++static int nurbs_begins, nurbs_ends, nurbs_vertices, nurbs_normals, nurbs_data_vertices;
++static GLenum nurbs_mode, nurbs_error;
++static GLfloat nurbs_first[3], nurbs_last[3], nurbs_radius_error, nurbs_normal_error;
++static BOOL nurbs_data_ptr;
++
++static void CALLBACK nurbs_begin_cb( GLenum mode )
++{
++    nurbs_begins++;
++    nurbs_mode = mode;
++}
++
++static void CALLBACK nurbs_vertex_cb( GLfloat *v )
++{
++    GLfloat r = sqrtf( v[0] * v[0] + v[1] * v[1] );
++
++    if (!nurbs_vertices++) memcpy( nurbs_first, v, sizeof(nurbs_first) );
++    memcpy( nurbs_last, v, sizeof(nurbs_last) );
++    if (fabsf( r - 1.0f ) > nurbs_radius_error) nurbs_radius_error = fabsf( r - 1.0f );
++}
++
++static void CALLBACK nurbs_vertex_data_cb( GLfloat *v, void *data )
++{
++    nurbs_data_vertices++;
++    if (data) nurbs_data_ptr = TRUE;
++}
++
++static void CALLBACK nurbs_normal_cb( GLfloat *n )
++{
++    GLfloat len = sqrtf( n[0] * n[0] + n[1] * n[1] + n[2] * n[2] );
++
++    nurbs_normals++;
++    if (fabsf( len - 1.0f ) > nurbs_normal_error) nurbs_normal_error = fabsf( len - 1.0f );
++}
++
++static void CALLBACK nurbs_end_cb( void )
++{
++    nurbs_ends++;
++}
++
++static void CALLBACK nurbs_error_cb( GLenum code )
++{
++    nurbs_error = code;
++}
++
++static void reset_nurbs_counts(void)
++{
++    nurbs_begins = nurbs_ends = nurbs_vertices = nurbs_normals = nurbs_data_vertices = 0;
++    nurbs_mode = nurbs_error = 0;
++    nurbs_radius_error = nurbs_normal_error = 0.0f;
++    nurbs_data_ptr = FALSE;
++}
++
++/* unit circle as a rational quadratic NURBS curve: 9 homogeneous points, 4 knot spans */
++static GLfloat circle_knots[12] = { 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 4 };
++static GLfloat circle_points[36];
++
++static void init_circle(void)
++{
++    static const GLfloat xy[9][2] = { {1,0}, {1,1}, {0,1}, {-1,1}, {-1,0}, {-1,-1}, {0,-1}, {1,-1}, {1,0} };
++    int i;
++
++    for (i = 0; i < 9; i++)
++    {
++        GLfloat w = (i % 2) ? sqrtf( 0.5f ) : 1.0f;
++        circle_points[4 * i] = xy[i][0] * w;
++        circle_points[4 * i + 1] = xy[i][1] * w;
++        circle_points[4 * i + 2] = 0.0f;
++        circle_points[4 * i + 3] = w;
++    }
++}
++
++static void test_nurbs_properties(void)
++{
++    static const struct { GLenum prop; GLfloat value; } defaults[] =
++    {
++        { GLU_SAMPLING_METHOD, GLU_PATH_LENGTH },
++        { GLU_SAMPLING_TOLERANCE, 50.0f },
++        { GLU_PARAMETRIC_TOLERANCE, 0.5f },
++        { GLU_U_STEP, 100.0f },
++        { GLU_V_STEP, 100.0f },
++        { GLU_DISPLAY_MODE, GLU_FILL },
++        { GLU_CULLING, GL_FALSE },
++        { GLU_AUTO_LOAD_MATRIX, GL_TRUE },
++    };
++    GLUnurbs *nurbs = gluNewNurbsRenderer();
++    char path[MAX_PATH];
++    GLfloat value;
++    unsigned int i;
++
++    GetModuleFileNameA( GetModuleHandleA( "glu32.dll" ), path, sizeof(path) );
++    trace( "glu32 module %s\n", path );
++    ok( nurbs != NULL, "gluNewNurbsRenderer failed\n" );
++    if (!nurbs) return;
++    gluNurbsCallback( nurbs, GLU_NURBS_ERROR, (void (CALLBACK *)(void))nurbs_error_cb );
++    for (i = 0; i < ARRAY_SIZE(defaults); i++)
++    {
++        value = -1.0f;
++        gluGetNurbsProperty( nurbs, defaults[i].prop, &value );
++        ok( value == defaults[i].value, "property %u: got %f, expected %f\n", defaults[i].prop, value,
++            defaults[i].value );
++    }
++    gluNurbsProperty( nurbs, GLU_SAMPLING_TOLERANCE, 10.0f );
++    gluGetNurbsProperty( nurbs, GLU_SAMPLING_TOLERANCE, &value );
++    ok( value == 10.0f, "got %f\n", value );
++
++    reset_nurbs_counts();
++    gluNurbsProperty( nurbs, GLU_SAMPLING_TOLERANCE, -1.0f );
++    ok( nurbs_error == GLU_INVALID_VALUE, "got error %u\n", nurbs_error );
++    gluGetNurbsProperty( nurbs, GLU_SAMPLING_TOLERANCE, &value );
++    ok( value == 10.0f, "got %f\n", value );
++    reset_nurbs_counts();
++    gluNurbsProperty( nurbs, 0xdead, 1.0f );
++    ok( nurbs_error == GLU_INVALID_ENUM, "got error %u\n", nurbs_error );
++    gluDeleteNurbsRenderer( nurbs );
++}
++
++static void test_nurbs_tessellator(void)
++{
++    static const GLfloat identity[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
++    static const GLint viewport[4] = { 0, 0, 400, 400 };
++    GLfloat value = 0.0f, knots[8] = { 0, 0, 0, 0, 1, 1, 1, 1 }, patch[48];
++    GLUnurbs *nurbs = gluNewNurbsRenderer();
++    int i, j;
++
++    if (!nurbs) return;
++    gluNurbsCallback( nurbs, GLU_NURBS_ERROR, (void (CALLBACK *)(void))nurbs_error_cb );
++    gluGetNurbsProperty( nurbs, GLU_NURBS_MODE, &value );
++    if (value != GLU_NURBS_RENDERER)
++    {
++        win_skip( "GLU 1.3 tessellator mode is not supported\n" );
++        gluDeleteNurbsRenderer( nurbs );
++        return;
++    }
++    gluNurbsProperty( nurbs, GLU_NURBS_MODE, GLU_NURBS_TESSELLATOR );
++    gluGetNurbsProperty( nurbs, GLU_NURBS_MODE, &value );
++    ok( value == GLU_NURBS_TESSELLATOR, "got %f\n", value );
++    gluNurbsCallback( nurbs, GLU_NURBS_BEGIN, (void (CALLBACK *)(void))nurbs_begin_cb );
++    gluNurbsCallback( nurbs, GLU_NURBS_VERTEX, (void (CALLBACK *)(void))nurbs_vertex_cb );
++    gluNurbsCallback( nurbs, GLU_NURBS_END, (void (CALLBACK *)(void))nurbs_end_cb );
++    gluNurbsProperty( nurbs, GLU_AUTO_LOAD_MATRIX, GL_FALSE );
++    gluLoadSamplingMatrices( nurbs, identity, identity, viewport );
++
++    /* domain distance: 8 steps per knot span, 4 spans */
++    init_circle();
++    reset_nurbs_counts();
++    gluNurbsProperty( nurbs, GLU_SAMPLING_METHOD, GLU_DOMAIN_DISTANCE );
++    gluNurbsProperty( nurbs, GLU_U_STEP, 8.0f );
++    gluBeginCurve( nurbs );
++    gluNurbsCurve( nurbs, 12, circle_knots, 4, circle_points, 3, GL_MAP1_VERTEX_4 );
++    gluEndCurve( nurbs );
++    ok( !nurbs_error, "got error %u\n", nurbs_error );
++    ok( nurbs_begins == 1 && nurbs_ends == 1, "got %d begins, %d ends\n", nurbs_begins, nurbs_ends );
++    ok( nurbs_mode == GL_LINE_STRIP, "got mode %#x\n", nurbs_mode );
++    ok( nurbs_vertices == 33, "got %d vertices\n", nurbs_vertices );
++    ok( nurbs_radius_error < 1e-5f, "points are %g off the circle\n", nurbs_radius_error );
++    ok( nurbs_first[0] == 1.0f && nurbs_first[1] == 0.0f, "first point %f,%f\n", nurbs_first[0], nurbs_first[1] );
++    ok( fabsf( nurbs_last[0] - 1.0f ) < 1e-6f && fabsf( nurbs_last[1] ) < 1e-6f,
++        "last point %f,%f\n", nurbs_last[0], nurbs_last[1] );
++
++    /* path length in pixels: the circle is 200 pixels in radius, no edge is longer than 10 pixels */
++    reset_nurbs_counts();
++    gluNurbsProperty( nurbs, GLU_SAMPLING_METHOD, GLU_PATH_LENGTH );
++    gluNurbsProperty( nurbs, GLU_SAMPLING_TOLERANCE, 10.0f );
++    gluNurbsCurve( nurbs, 12, circle_knots, 4, circle_points, 3, GL_MAP1_VERTEX_4 );
++    ok( nurbs_vertices > 126 && nurbs_vertices <= 1 + 4 * 1024, "got %d vertices\n", nurbs_vertices );
++    ok( nurbs_radius_error < 1e-5f, "points are %g off the circle\n", nurbs_radius_error );
++
++    /* invalid curves are reported and not drawn */
++    reset_nurbs_counts();
++    gluBeginCurve( nurbs );
++    gluNurbsCurve( nurbs, 12, circle_knots, 4, circle_points, 0, GL_MAP1_VERTEX_4 );
++    gluEndCurve( nurbs );
++    ok( nurbs_error == GLU_NURBS_ERROR8, "got error %u\n", nurbs_error );
++    ok( !nurbs_vertices, "got %d vertices\n", nurbs_vertices );
++    reset_nurbs_counts();
++    gluNurbsCurve( nurbs, 12, circle_knots, 4, circle_points, 0, GL_MAP1_VERTEX_4 );
++    ok( nurbs_error == GLU_NURBS_ERROR1, "got error %u\n", nurbs_error );
++    reset_nurbs_counts();
++    gluNurbsCurve( nurbs, 5, circle_knots, 4, circle_points, 3, GL_MAP1_VERTEX_4 );
++    ok( nurbs_error == GLU_NURBS_ERROR2, "got error %u\n", nurbs_error );
++    reset_nurbs_counts();
++    gluEndCurve( nurbs );
++    ok( nurbs_error == GLU_NURBS_ERROR7, "got error %u\n", nurbs_error );
++    reset_nurbs_counts();
++    gluPwlCurve( nurbs, 2, knots, 2, GLU_MAP1_TRIM_2 );
++    ok( nurbs_error == GLU_NURBS_ERROR19, "got error %u\n", nurbs_error );
++
++    /* the _DATA form wins over the plain one and gets the (NULL) user data */
++    reset_nurbs_counts();
++    gluNurbsCallback( nurbs, GLU_NURBS_VERTEX_DATA, (void (CALLBACK *)(void))nurbs_vertex_data_cb );
++    gluNurbsProperty( nurbs, GLU_SAMPLING_METHOD, GLU_DOMAIN_DISTANCE );
++    gluNurbsCurve( nurbs, 12, circle_knots, 4, circle_points, 3, GL_MAP1_VERTEX_4 );
++    ok( nurbs_data_vertices == 33 && !nurbs_vertices, "got %d, %d vertices\n", nurbs_data_vertices, nurbs_vertices );
++    ok( !nurbs_data_ptr, "got user data\n" );
++    gluNurbsCallback( nurbs, GLU_NURBS_VERTEX_DATA, NULL );
++
++    /* bicubic patch with a bump, 4 x 3 steps: 3 quad strips of 5 x 2 vertices, computed normals */
++    for (i = 0; i < 4; i++)
++        for (j = 0; j < 4; j++)
++        {
++            patch[(i * 4 + j) * 3] = i / 3.0f;
++            patch[(i * 4 + j) * 3 + 1] = j / 3.0f;
++            patch[(i * 4 + j) * 3 + 2] = (i == 1 || i == 2) && (j == 1 || j == 2) ? 0.5f : 0.0f;
++        }
++    reset_nurbs_counts();
++    gluNurbsCallback( nurbs, GLU_NURBS_NORMAL, (void (CALLBACK *)(void))nurbs_normal_cb );
++    gluNurbsProperty( nurbs, GLU_U_STEP, 4.0f );
++    gluNurbsProperty( nurbs, GLU_V_STEP, 3.0f );
++    gluBeginSurface( nurbs );
++    gluNurbsSurface( nurbs, 8, knots, 8, knots, 12, 3, patch, 4, 4, GL_MAP2_VERTEX_3 );
++    gluEndSurface( nurbs );
++    ok( !nurbs_error, "got error %u\n", nurbs_error );
++    ok( nurbs_begins == 3 && nurbs_ends == 3, "got %d begins, %d ends\n", nurbs_begins, nurbs_ends );
++    ok( nurbs_mode == GL_QUAD_STRIP, "got mode %#x\n", nurbs_mode );
++    ok( nurbs_vertices == 30 && nurbs_normals == 30, "got %d vertices, %d normals\n", nurbs_vertices, nurbs_normals );
++    ok( nurbs_normal_error < 1e-5f, "normals are %g off unit length\n", nurbs_normal_error );
++
++    gluDeleteNurbsRenderer( nurbs );
++}
++
++/* renderer mode draws with OpenGL: a white circle on black */
++static void test_nurbs_renderer( HDC hdc )
++{
++    GLUnurbs *nurbs = gluNewNurbsRenderer();
++    GLint viewport[4];
++    GLubyte *pixels;
++    int x, y, lit = 0, inside = 0;
++
++    if (!nurbs) return;
++    gluNurbsCallback( nurbs, GLU_NURBS_ERROR, (void (CALLBACK *)(void))nurbs_error_cb );
++    glGetIntegerv( GL_VIEWPORT, viewport );
++    glMatrixMode( GL_PROJECTION );
++    glLoadIdentity();
++    glMatrixMode( GL_MODELVIEW );
++    glLoadIdentity();
++    glScalef( 0.8f, 0.8f, 1.0f );
++    glClearColor( 0, 0, 0, 1 );
++    glClear( GL_COLOR_BUFFER_BIT );
++    glColor3f( 1, 1, 1 );
++    init_circle();
++    reset_nurbs_counts();
++    gluNurbsProperty( nurbs, GLU_SAMPLING_TOLERANCE, 5.0f );
++    gluBeginCurve( nurbs );
++    gluNurbsCurve( nurbs, 12, circle_knots, 4, circle_points, 3, GL_MAP1_VERTEX_4 );
++    gluEndCurve( nurbs );
++    ok( !nurbs_error, "got error %u\n", nurbs_error );
++    ok( glGetError() == GL_NO_ERROR, "got GL error %#x\n", glGetError() );
++    glFinish();
++
++    pixels = HeapAlloc( GetProcessHeap(), 0, viewport[2] * viewport[3] * 4 );
++    glReadBuffer( GL_BACK );
++    glReadPixels( 0, 0, viewport[2], viewport[3], GL_RGBA, GL_UNSIGNED_BYTE, pixels );
++    for (y = 0; y < viewport[3]; y++)
++        for (x = 0; x < viewport[2]; x++)
++        {
++            GLfloat dx = (x + 0.5f) * 2 / viewport[2] - 1, dy = (y + 0.5f) * 2 / viewport[3] - 1;
++            if (pixels[(y * viewport[2] + x) * 4] < 128) continue;
++            lit++;
++            if (dx * dx + dy * dy < 0.5f * 0.5f) inside++;
++        }
++    trace( "viewport %dx%d, %d lit pixels\n", viewport[2], viewport[3], lit );
++    ok( lit > viewport[2] && lit < viewport[2] * viewport[3] / 4, "got %d lit pixels\n", lit );
++    ok( !inside, "got %d lit pixels inside the circle\n", inside );
++    HeapFree( GetProcessHeap(), 0, pixels );
++    gluDeleteNurbsRenderer( nurbs );
++}
++
+ START_TEST(glu)
+ {
+     HWND hwnd;
+@@ -149,6 +417,9 @@ START_TEST(glu)
+         }
+ 
+         test_gluScaleImage(hdc, hglrc);
++        test_nurbs_properties();
++        test_nurbs_tessellator();
++        test_nurbs_renderer(hdc);
+ 
+ cleanup:
+         wglDeleteContext(hglrc);
+diff --git a/include/wine/glu.h b/include/wine/glu.h
+index c5e2ef1..e32e942 100644
+--- a/include/wine/glu.h
++++ b/include/wine/glu.h
+@@ -192,6 +192,13 @@ typedef void (CALLBACK *GLUnurbsErrorProc)(GLenum);
+ #define GLU_SAMPLING_METHOD 100205
+ #define GLU_U_STEP 100206
+ #define GLU_V_STEP 100207
++#define GLU_NURBS_MODE 100160
++
++#define GLU_NURBS_TESSELLATOR 100161
++#define GLU_NURBS_RENDERER 100162
++
++#define GLU_OBJECT_PARAMETRIC_ERROR 100208
++#define GLU_OBJECT_PATH_LENGTH 100209
+ 
+ #define GLU_PATH_LENGTH 100215
+ #define GLU_PARAMETRIC_ERROR 100216
+@@ -203,6 +210,20 @@ typedef void (CALLBACK *GLUnurbsErrorProc)(GLenum);
+ #define GLU_OUTLINE_POLYGON 100240
+ #define GLU_OUTLINE_PATCH 100241
+ 
++#define GLU_NURBS_ERROR 100103
++#define GLU_NURBS_BEGIN 100164
++#define GLU_NURBS_VERTEX 100165
++#define GLU_NURBS_NORMAL 100166
++#define GLU_NURBS_COLOR 100167
++#define GLU_NURBS_TEXTURE_COORD 100168
++#define GLU_NURBS_END 100169
++#define GLU_NURBS_BEGIN_DATA 100170
++#define GLU_NURBS_VERTEX_DATA 100171
++#define GLU_NURBS_NORMAL_DATA 100172
++#define GLU_NURBS_COLOR_DATA 100173
++#define GLU_NURBS_TEXTURE_COORD_DATA 100174
++#define GLU_NURBS_END_DATA 100175
++
+ #define GLU_NURBS_ERROR1 100251
+ #define GLU_NURBS_ERROR2 100252
+ #define GLU_NURBS_ERROR3 100253

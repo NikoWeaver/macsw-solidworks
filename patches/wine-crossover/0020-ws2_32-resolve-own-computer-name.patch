@@ -1,0 +1,62 @@
+From: MacSW maintainers
+Subject: [PATCH] ws2_32: Resolve the computer name of the local machine.
+
+Windows resolves its own short host name and the NetBIOS name that
+GetComputerName() returns. On macOS only "<LocalHostName>.local" resolves
+(through mDNSResponder), while Wine's gethostbyname() treats only the exact
+gethostname() string as local and getaddrinfo() compares names case-sensitively.
+Lookups of the own computer name therefore fail with WSAHOST_NOT_FOUND, for
+example the SOLIDWORKS crash reporter's CEIP upload.
+
+Add is_local_host_name() (short host name or NetBIOS name, any case).
+gethostbyname() then returns the local addresses, and getaddrinfo() retries
+with the FQDN before it uses the old loopback fallback.
+
+diff --git a/dlls/ws2_32/protocol.c b/dlls/ws2_32/protocol.c
+index cdc01a8..dce75d2 100644
+--- a/dlls/ws2_32/protocol.c
++++ b/dlls/ws2_32/protocol.c
+@@ -45,6 +45,20 @@ static char *get_fqdn(void)
+     return ret;
+ }
+ 
++/* Windows always resolves its own short host name and the NetBIOS name that
++ * GetComputerName() returns (for example "MYMAC" for "mymac.local").  On macOS
++ * only the full "<LocalHostName>.local" name resolves, through mDNSResponder. */
++static BOOL is_local_host_name( const char *name, const char *fqdn )
++{
++    char computer[MAX_COMPUTERNAME_LENGTH + 1];
++    DWORD size = sizeof(computer);
++    size_t len = strlen( name );
++
++    if (!len) return FALSE;
++    if (fqdn && !_strnicmp( fqdn, name, len ) && (!fqdn[len] || fqdn[len] == '.')) return TRUE;
++    return GetComputerNameA( computer, &size ) && !_stricmp( computer, name );
++}
++
+ /* call Unix getaddrinfo, allocating a large enough buffer */
+ static int do_getaddrinfo( const char *node, const char *service,
+                            const struct addrinfo *hints, struct addrinfo **info )
+@@ -203,7 +217,12 @@ int WINAPI getaddrinfo( const char *node, const char *service,
+             free( nodev6 );
+             return WSA_NOT_ENOUGH_MEMORY;
+         }
+-        if (!strcmp( fqdn, node ) || (!strncmp( fqdn, node, strlen( node ) ) && fqdn[strlen( node )] == '.'))
++        BOOL local = is_local_host_name( node, fqdn );
++
++        /* The short or NetBIOS name has no record, but the full host name may
++         * still resolve (on macOS "<name>.local" does, through mDNSResponder). */
++        if (local && _stricmp( fqdn, node )) ret = do_getaddrinfo( fqdn, service, hints, info );
++        if (ret && local)
+         {
+             /* If it didn't work it means the host name IP is not in /etc/hosts, try again
+              * by sending a NULL host and avoid sending a NULL servname too because that
+@@ -953,7 +972,7 @@ struct hostent * WINAPI gethostbyname( const char *name )
+ 
+     /* If the hostname of the local machine is requested then return the
+      * complete list of local IP addresses */
+-    if (!strcmp( name, hostname ))
++    if (!strcmp( name, hostname ) || is_local_host_name( name, hostname ))
+         host = get_local_ips( hostname );
+ 
+     /* If any other hostname was requested (or the routing table lookup failed)

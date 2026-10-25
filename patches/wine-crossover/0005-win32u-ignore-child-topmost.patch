@@ -1,0 +1,16 @@
+diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -4233,2 +4233,12 @@ BOOL WINAPI NtUserSetWindowPos( HWND hwnd, HWND after, INT x, INT y, INT cx, INT cy, UINT flags )
++    /* Windows ignores topmost changes for real child windows. A WS_CHILD
++     * window parented to the desktop (e.g. ComboLBox) must still be moved
++     * and shown, including when SWP_SHOWWINDOW is set. */
++    if (!(flags & SWP_NOZORDER) && (after == HWND_TOPMOST || after == HWND_NOTOPMOST) &&
++        (get_window_long( hwnd, GWL_STYLE ) & (WS_CHILD | WS_POPUP)) == WS_CHILD)
++    {
++        HWND parent = NtUserGetAncestor( hwnd, GA_PARENT );
++        if (parent && parent != get_desktop_window()) return TRUE;
++    }
++
+     winpos.hwnd = get_full_window_handle( hwnd );
+     winpos.hwndInsertAfter = get_full_window_handle( after );

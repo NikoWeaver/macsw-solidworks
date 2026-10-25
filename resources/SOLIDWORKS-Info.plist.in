@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- SOLIDWORKS.app (scripts/package_solidworks_app.sh). Its process becomes the Wine host,
+         so the keys AppKit reads for Wine match the loader's own plist (loader/wine_info.plist.in):
+         NSPrincipalClass, no NSHighResolutionCapable. LSUIElement is left out on purpose: the app
+         has a Dock tile from launch (patch 0025, MACSW_APP_BUNDLE). The package script copies
+         CFBundleDocumentTypes and UTImportedTypeDeclarations from Info.plist.in. -->
+    <key>CFBundleAllowMixedLocalizations</key>
+    <true/>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>English</string>
+    <key>CFBundleDisplayName</key>
+    <string>SOLIDWORKS</string>
+    <key>CFBundleExecutable</key>
+    <string>SOLIDWORKS</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.yjbeetle.macsw.solidworks</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>SOLIDWORKS</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>@APP_VERSION@</string>
+    <key>CFBundleVersion</key>
+    <string>@APP_BUILD@</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.graphics-design</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>@MACOS_DEPLOYMENT_TARGET@</string>
+    <key>LSRequiresNativeExecution</key>
+    <true/>
+    <key>NSPrincipalClass</key>
+    <string>WineApplication</string>
+</dict>
+</plist>

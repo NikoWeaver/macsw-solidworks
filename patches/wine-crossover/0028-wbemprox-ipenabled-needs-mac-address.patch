@@ -1,0 +1,17 @@
+diff --git a/dlls/wbemprox/builtin.c b/dlls/wbemprox/builtin.c
+--- a/dlls/wbemprox/builtin.c
++++ b/dlls/wbemprox/builtin.c
+@@ -3485,9 +3485,12 @@
+         rec->index                = aa->IfIndex;
+         rec->ipaddress            = get_ipaddress( aa->FirstUnicastAddress );
+         rec->ipconnectionmetric   = 20;
+-        rec->ipenabled            = -1;
+         rec->ipsubnet             = get_ipsubnet( aa->FirstUnicastAddress );
+         rec->mac_address          = get_mac_address( aa->PhysicalAddress, aa->PhysicalAddressLength );
++        /* Report IPEnabled only for adapters with a hardware address, as Windows does for its
++         * tunnel adapters. Callers list MAC addresses with "WHERE IPEnabled=TRUE", and SOLIDWORKS
++         * loops forever on a row with a NULL MACAddress (macOS gif0, stf0, utun*). */
++        rec->ipenabled            = rec->mac_address ? -1 : 0;
+         rec->settingid            = get_settingid( rec->index );
+         if (!match_row( table, row, cond, &status ))
+         {

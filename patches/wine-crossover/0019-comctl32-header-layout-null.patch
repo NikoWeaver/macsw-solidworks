@@ -1,0 +1,27 @@
+From: MacSW maintainers
+Subject: [PATCH] comctl32: Ignore HDM_LAYOUT when the HDLAYOUT is NULL or incomplete.
+
+SOLIDWORKS 2026 sends HDM_LAYOUT with wParam = 0 and lParam = NULL to a
+SysHeader32 control (sldimporttabu.dll, "set header height"). HEADER_Layout()
+read lpLayout->pwpos without a check, so SLDWORKS.exe died with an access
+violation (read of address 0x8) right after the License Agreement page.
+Return FALSE instead of touching the structure. The caller ignores the result.
+
+header.c is built into comctl32 v5 and v6, so both get the guard. Wine's own
+senders (listview.c, winefile.c) always pass a valid HDLAYOUT, so their
+behaviour does not change.
+
+diff --git a/dlls/comctl32/header.c b/dlls/comctl32/header.c
+index 2543e0a..dc4df5d 100644
+--- a/dlls/comctl32/header.c
++++ b/dlls/comctl32/header.c
+@@ -1495,6 +1495,9 @@ HEADER_InsertItemT (HEADER_INFO *infoPtr, INT nItem, const HDITEMW *phdi, BOOL b
+ static LRESULT
+ HEADER_Layout (HEADER_INFO *infoPtr, LPHDLAYOUT lpLayout)
+ {
++    if (!lpLayout || !lpLayout->prc || !lpLayout->pwpos)
++        return FALSE;
++
+     lpLayout->pwpos->hwndInsertAfter = 0;
+     lpLayout->pwpos->x = lpLayout->prc->left;
+     lpLayout->pwpos->y = lpLayout->prc->top;

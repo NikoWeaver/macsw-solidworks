@@ -1,0 +1,79 @@
+From: MacSW maintainers
+Subject: [PATCH] ntdll: Probe executable PE file mappings before using them on macOS.
+
+Hardened Runtime can allow anonymous executable memory while rejecting
+executable file-backed mappings of Windows PE images. Mapping a section RW
+first hides this failure until the final mprotect(), after the existing
+read() fallback can no longer be used. wineboot then fails before initializing a
+fresh prefix.
+
+Request execute access while mapping executable sections so macOS reports
+EACCES/EPERM at mmap(), and the existing private read() fallback keeps the
+section in anonymous memory. Preserve shared writable mapping semantics,
+non-executable section protections and the non-macOS mapping path.
+
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -2370,6 +2370,13 @@ static NTSTATUS map_file_into_view( struct file_view *view, int fd, size_t start,
+ #endif
+     }
+ 
++#ifdef __APPLE__
++    /* Probe executable file mappings now: Hardened Runtime may only allow
++     * anonymous executable memory. Let the existing read() fallback handle
++     * EACCES/EPERM rather than failing the final section mprotect(). */
++    if (vprot & VPROT_EXEC) prot |= PROT_EXEC;
++#endif
++
+     map_size = ROUND_SIZE( start, size, page_mask );
+     map_addr = ROUND_ADDR( (char *)view->base + start, page_mask );
+     host_addr = ROUND_ADDR( (char *)view->base + start, host_page_mask );
+@@ -2410,6 +2417,15 @@ static NTSTATUS map_file_into_view( struct file_view *view, int fd, size_t start,
+         case EACCES:
+         case EPERM:  /* access error, fall back to read() */
+             if (vprot & VPROT_WRITE) return STATUS_ACCESS_DENIED;
++#ifdef __APPLE__
++            if (vprot & VPROT_EXEC)
++            {
++                /* A flat image may already overlap the file-backed header.
++                 * A private COW write is not enough to make it executable. */
++                if (anon_mmap_fixed( host_addr, host_size, PROT_READ | PROT_WRITE, 0 ) == MAP_FAILED)
++                    return STATUS_NO_MEMORY;
++            }
++#endif
+             break;
+         default:
+             ERR( "mmap error %s, range %p-%p, unix_prot %#x\n",
+@@ -3086,7 +3093,7 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRING
+         /* in that case Windows simply maps in the whole file */
+ 
+         total_size = min( total_size, ROUND_SIZE( 0, st.st_size, page_mask ));
+-        if (map_file_into_view( view, fd, 0, total_size, 0, VPROT_COMMITTED | VPROT_READ | VPROT_WRITECOPY,
++        if (map_file_into_view( view, fd, 0, total_size, 0, VPROT_COMMITTED | VPROT_READ | VPROT_WRITECOPY | VPROT_EXEC,
+                                 removable ) != STATUS_SUCCESS) goto done;
+ 
+         /* check that all sections are loaded at the right offset */
+@@ -3115,6 +3122,7 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRING
+     {
+         static const SIZE_T sector_align = 0x1ff;
+         SIZE_T map_size, file_start, file_size, end;
++        unsigned int vprot = VPROT_COMMITTED | VPROT_READ | VPROT_WRITECOPY;
+ 
+         if (!sec[i].Misc.VirtualSize)
+             map_size = ROUND_SIZE( 0, sec[i].SizeOfRawData, align_mask );
+@@ -3170,5 +3178,6 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRING
+          *       fall back to read(), so we don't need to check anything here.
+          */
++        if (sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) vprot |= VPROT_EXEC;
+         end = file_start + file_size;
+         if (sec[i].PointerToRawData >= st.st_size ||
+             end > ((st.st_size + sector_align) & ~sector_align) ||
+@@ -3177,7 +3186,6 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRING
+             end < file_start ||
+             map_file_into_view( view, fd, sec[i].VirtualAddress, file_size, file_start,
+-                                VPROT_COMMITTED | VPROT_READ | VPROT_WRITECOPY,
+-                                removable ) != STATUS_SUCCESS)
++                                vprot, removable ) != STATUS_SUCCESS)
+         {
+             ERR_(module)( "Could not map %s section %.8s, file probably truncated\n",
+                           debugstr_us(nt_name), sec[i].Name );

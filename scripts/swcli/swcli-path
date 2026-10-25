@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export PYTHONDONTWRITEBYTECODE=1
+exec "${SCRIPT_DIR}/../runtime/PythonNative/bin/python3" \
+    "${SCRIPT_DIR}/swcli_path.py" "$@"

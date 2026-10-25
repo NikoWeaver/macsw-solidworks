@@ -1,0 +1,20 @@
+MacSW
+Copyright 2026 YJBeetle
+
+MacSW's original source code is licensed under the Apache License, Version 2.0.
+
+This product includes Wine and modifications derived from Wine. Wine and the
+Wine-derived patches remain licensed under the GNU Lesser General Public
+License, version 2.1 or later.
+
+Bundled third-party components retain their respective licenses and copyright
+notices. Copies of the applicable notices are included with binary releases.
+
+The Apache License does not grant permission to use the MacSW name, logo, or
+other project branding to identify a modified or redistributed product as an
+official MacSW release.
+
+This copy is a modified version of MacSW, based on YJBeetle/MacSW commit
+69c5509. It is not an official MacSW release. CHANGES-FROM-UPSTREAM.md lists
+the changed areas, and THIRD_PARTY_NOTICES.md (THIRD_PARTY_NOTICES.txt in the
+app) lists the bundled third-party components with their licences.

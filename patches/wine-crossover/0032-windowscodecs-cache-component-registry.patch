@@ -1,0 +1,269 @@
+From: MacSW maintainers
+Subject: [PATCH] windowscodecs: Cache the component registry per process (MACSW_WIC_COMPONENT_CACHE=1).
+
+CreateComponentEnumerator() opens CLSID\{category}\Instance and enumerates
+it on every call, and IWICBitmapCodecInfo::GetContainerFormat() /
+IWICMetadataHandlerInfo::GetMetadataFormat() read the registry on every call.
+ImagingFactory_CreateDecoder() and the metadata reader lookup of every frame
+go through both, so one decode costs about 25 wineserver round trips.
+SOLIDWORKS 2026 decodes thousands of PNG icons while it starts: a timestamped
++server trace of its main thread had 358,000 of its 920,000 requests before
+the main window in this code (297,843 enum_key on the two Instance keys,
+21,000 opens each of CLSID, {category} and Instance, 63,000 ContainerFormat
+reads). Under Rosetta one round trip costs 15-20 us.
+
+With MACSW_WIC_COMPONENT_CACHE=1 in the environment, the CLSID lists of all
+categories are read once, on the first enumeration, and kept for the life of
+the process; component objects were already cached (component_info_cache),
+and the GUID values they return are now read once per component. The
+enumeration result is the same as before (same order, same per-category
+error handling). Components registered after the first enumeration are not
+seen until the process restarts; WIC codecs are registered by installers.
+The lists live until the process exits, and a failure to open HKCR\CLSID is
+kept too (stock Wine retries; that key exists in every prefix).
+Without the variable nothing changes. MacSW sets it for SOLIDWORKS and
+sw-cli launches (WineService.environment(solidWorks: true), sw-cli,
+wine_runtime.py).
+
+diff --git a/dlls/windowscodecs/info.c b/dlls/windowscodecs/info.c
+index 4063196..97e57a3 100644
+--- a/dlls/windowscodecs/info.c
++++ b/dlls/windowscodecs/info.c
+@@ -40,8 +40,30 @@ typedef struct {
+     CLSID clsid;
+     HKEY classkey;
+     struct wine_rb_entry entry;
++    /* MacSW: GUID values already read from classkey (see component_cache_enabled) */
++    struct { const WCHAR *name; HRESULT hr; GUID guid; } guid_values[4];
++    unsigned int guid_value_count;
+ } ComponentInfo;
+ 
++static CRITICAL_SECTION component_info_cache_cs;
++
++/* MacSW: with MACSW_WIC_COMPONENT_CACHE=1 the component registry (CLSID\{category}\Instance lists
++ * and the GUID values of a component) is read once per process instead of on every decoder or
++ * metadata reader lookup. SOLIDWORKS creates thousands of decoders at start-up, and every lookup
++ * cost about 25 wineserver round trips. The registry is only written by installers. */
++static BOOL component_cache_enabled(void)
++{
++    static LONG enabled = -1;
++
++    if (enabled == -1)
++    {
++        WCHAR value[4];
++        DWORD len = GetEnvironmentVariableW(L"MACSW_WIC_COMPONENT_CACHE", value, ARRAY_SIZE(value));
++        InterlockedExchange(&enabled, len == 1 && value[0] == '1');
++    }
++    return enabled;
++}
++
+ static void component_info_init(ComponentInfo *object, HKEY classkey,
+         REFGUID clsid, const IWICComponentInfoVtbl *vtbl)
+ {
+@@ -49,6 +71,7 @@ static void component_info_init(ComponentInfo *object, HKEY classkey,
+     object->ref = 1;
+     object->classkey = classkey;
+     object->clsid = *clsid;
++    object->guid_value_count = 0;
+ }
+ 
+ static void component_info_cleanup(ComponentInfo *info)
+@@ -86,17 +109,13 @@ static HRESULT ComponentInfo_GetStringValue(ComponentInfo *info, LPCWSTR value,
+     return HRESULT_FROM_WIN32(ret);
+ }
+ 
+-static HRESULT ComponentInfo_GetGUIDValue(ComponentInfo *info, LPCWSTR value,
+-    GUID *result)
++static HRESULT read_guid_value(ComponentInfo *info, LPCWSTR value, GUID *result)
+ {
+     LONG ret;
+     WCHAR guid_string[39];
+     DWORD cbdata = sizeof(guid_string);
+     HRESULT hr;
+ 
+-    if (!result)
+-        return E_INVALIDARG;
+-
+     ret = RegGetValueW(info->classkey, NULL, value, RRF_RT_REG_SZ|RRF_NOEXPAND, NULL,
+         guid_string, &cbdata);
+ 
+@@ -114,6 +133,41 @@ static HRESULT ComponentInfo_GetGUIDValue(ComponentInfo *info, LPCWSTR value,
+     return hr;
+ }
+ 
++static HRESULT ComponentInfo_GetGUIDValue(ComponentInfo *info, LPCWSTR value,
++    GUID *result)
++{
++    unsigned int i;
++    HRESULT hr;
++    GUID guid;
++
++    if (!result)
++        return E_INVALIDARG;
++
++    if (!component_cache_enabled())
++        return read_guid_value(info, value, result);
++
++    EnterCriticalSection(&component_info_cache_cs);
++    for (i = 0; i < info->guid_value_count; i++)
++    {
++        if (wcscmp(info->guid_values[i].name, value)) continue;
++        hr = info->guid_values[i].hr;
++        if (SUCCEEDED(hr)) *result = info->guid_values[i].guid;
++        LeaveCriticalSection(&component_info_cache_cs);
++        return hr;
++    }
++    hr = read_guid_value(info, value, &guid);
++    if (info->guid_value_count < ARRAY_SIZE(info->guid_values))
++    {
++        i = info->guid_value_count++;
++        info->guid_values[i].name = value;
++        info->guid_values[i].hr = hr;
++        info->guid_values[i].guid = guid;
++    }
++    LeaveCriticalSection(&component_info_cache_cs);
++    if (SUCCEEDED(hr)) *result = guid;
++    return hr;
++}
++
+ static HRESULT ComponentInfo_GetUINTValue(ComponentInfo *info, LPCWSTR value,
+     void *result)
+ {
+@@ -2246,7 +2300,6 @@ static int ComponentInfo_Compare(const void *key, const struct wine_rb_entry *en
+ 
+ static struct wine_rb_tree component_info_cache = { ComponentInfo_Compare };
+ 
+-static CRITICAL_SECTION component_info_cache_cs;
+ static CRITICAL_SECTION_DEBUG component_info_cache_cs_dbg =
+ {
+     0, 0, &component_info_cache_cs,
+@@ -2564,6 +2617,119 @@ static const IEnumUnknownVtbl ComponentEnumVtbl = {
+     ComponentEnum_Clone
+ };
+ 
++/* MacSW: the CLSIDs listed under CLSID\{category}\Instance, read once (component_cache_enabled). */
++static struct category_list
++{
++    LONG res;       /* last registry result, as in the uncached loop */
++    UINT count;
++    CLSID *clsids;
++} category_lists[ARRAY_SIZE(categories)];
++static LONG clsid_key_res = -1;
++
++static void read_category_list(HKEY clsidkey, const struct category *category, struct category_list *list)
++{
++    HKEY catidkey, instancekey;
++    WCHAR guidstring[39];
++    UINT capacity = 0;
++    CLSID clsid, *grown;
++    LONG res;
++    int i;
++
++    StringFromGUID2(category->catid, guidstring, 39);
++    res = RegOpenKeyExW(clsidkey, guidstring, 0, KEY_READ, &catidkey);
++    if (res == ERROR_SUCCESS)
++    {
++        res = RegOpenKeyExW(catidkey, L"Instance", 0, KEY_READ, &instancekey);
++        if (res == ERROR_SUCCESS)
++        {
++            for (i = 0;; i++)
++            {
++                DWORD guidstring_size = 39;
++                res = RegEnumKeyExW(instancekey, i, guidstring, &guidstring_size, NULL, NULL, NULL, NULL);
++                if (res != ERROR_SUCCESS) break;
++                if (FAILED(CLSIDFromString(guidstring, &clsid))) continue;
++                if (list->count == capacity)
++                {
++                    capacity = capacity ? capacity * 2 : 16;
++                    if (!(grown = realloc(list->clsids, capacity * sizeof(*grown))))
++                    {
++                        res = ERROR_OUTOFMEMORY;
++                        break;
++                    }
++                    list->clsids = grown;
++                }
++                list->clsids[list->count++] = clsid;
++            }
++            RegCloseKey(instancekey);
++        }
++        RegCloseKey(catidkey);
++    }
++    list->res = res;
++}
++
++static HRESULT create_cached_component_enumerator(DWORD componentTypes, IEnumUnknown **ppIEnumUnknown)
++{
++    ComponentEnum *This;
++    ComponentEnumItem *item;
++    const struct category *category;
++    struct category_list *list;
++    HKEY clsidkey;
++    HRESULT hr = S_OK;
++    UINT i;
++
++    EnterCriticalSection(&component_info_cache_cs);
++    if (clsid_key_res == -1)
++    {
++        clsid_key_res = RegOpenKeyExW(HKEY_CLASSES_ROOT, L"CLSID", 0, KEY_READ, &clsidkey);
++        if (clsid_key_res == ERROR_SUCCESS)
++        {
++            for (category = categories; category->type; category++)
++                read_category_list(clsidkey, category, &category_lists[category - categories]);
++            RegCloseKey(clsidkey);
++        }
++    }
++    LeaveCriticalSection(&component_info_cache_cs);
++    if (clsid_key_res != ERROR_SUCCESS)
++        return HRESULT_FROM_WIN32(clsid_key_res);
++
++    This = malloc(sizeof(ComponentEnum));
++    if (!This) return E_OUTOFMEMORY;
++
++    This->IEnumUnknown_iface.lpVtbl = &ComponentEnumVtbl;
++    This->ref = 1;
++    list_init(&This->objects);
++    InitializeCriticalSectionEx(&This->lock, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
++    This->lock.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": ComponentEnum.lock");
++
++    for (category = categories; category->type && hr == S_OK; category++)
++    {
++        if ((category->type & componentTypes) == 0) continue;
++        list = &category_lists[category - categories];
++        for (i = 0; i < list->count; i++)
++        {
++            if (!(item = malloc(sizeof(ComponentEnumItem)))) { hr = E_OUTOFMEMORY; break; }
++            if (SUCCEEDED(CreateComponentInfo(&list->clsids[i], (IWICComponentInfo **)&item->unk)))
++                list_add_tail(&This->objects, &item->entry);
++            else
++                free(item);
++        }
++        if (hr == S_OK && list->res != ERROR_SUCCESS && list->res != ERROR_NO_MORE_ITEMS)
++            hr = HRESULT_FROM_WIN32(list->res);
++    }
++
++    if (SUCCEEDED(hr))
++    {
++        IEnumUnknown_Reset(&This->IEnumUnknown_iface);
++        *ppIEnumUnknown = &This->IEnumUnknown_iface;
++    }
++    else
++    {
++        *ppIEnumUnknown = NULL;
++        IEnumUnknown_Release(&This->IEnumUnknown_iface);
++    }
++    return hr;
++}
++
+ HRESULT CreateComponentEnumerator(DWORD componentTypes, DWORD options, IEnumUnknown **ppIEnumUnknown)
+ {
+     ComponentEnum *This;
+@@ -2578,6 +2744,9 @@ HRESULT CreateComponentEnumerator(DWORD componentTypes, DWORD options, IEnumUnkn
+ 
+     if (options) FIXME("ignoring flags %lx\n", options);
+ 
++    if (component_cache_enabled())
++        return create_cached_component_enumerator(componentTypes, ppIEnumUnknown);
++
+     res = RegOpenKeyExW(HKEY_CLASSES_ROOT, L"CLSID", 0, KEY_READ, &clsidkey);
+     if (res != ERROR_SUCCESS)
+         return HRESULT_FROM_WIN32(res);

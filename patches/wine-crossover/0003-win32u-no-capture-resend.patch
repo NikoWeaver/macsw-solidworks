@@ -1,0 +1,27 @@
+diff --git a/dlls/win32u/input.c b/dlls/win32u/input.c
+--- a/dlls/win32u/input.c
++++ b/dlls/win32u/input.c
+@@ -2018,2 +2018,2 @@ BOOL set_capture_window( HWND hwnd, UINT gui_flags, HWND *prev_ret )
+-        if (previous)
++        if (previous && (previous != hwnd || !compat_no_capture_resend))
+             send_message( previous, WM_CAPTURECHANGED, 0, (LPARAM)hwnd );
+diff --git a/dlls/win32u/sysparams.c b/dlls/win32u/sysparams.c
+--- a/dlls/win32u/sysparams.c
++++ b/dlls/win32u/sysparams.c
+@@ -169,2 +169,3 @@ static BOOL emulate_modeset;
+ BOOL decorated_mode = TRUE;
++BOOL compat_no_capture_resend;
+ UINT64 thunk_lock_callback = 0;
+@@ -6013,3 +6014,5 @@ void sysparams_init(void)
+         if (strstr( app_compat_flags, "HIGHDPIAWARE" )) NtUserSetProcessDpiAwarenessContext( NTUSER_DPI_SYSTEM_AWARE, 0 );
+         if (strstr( app_compat_flags, "DPIUNAWARE" )) NtUserSetProcessDpiAwarenessContext( NTUSER_DPI_UNAWARE, 0 );
++        if (strstr( app_compat_flags, "WINE_NOCAPTURERESEND" ))
++            compat_no_capture_resend = TRUE;
+     }
+diff --git a/dlls/win32u/win32u_private.h b/dlls/win32u/win32u_private.h
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -163,2 +163,3 @@ extern void track_scroll_bar( HWND hwnd, int scrollbar, POINT pt );
+ extern UINT system_dpi;
++extern BOOL compat_no_capture_resend;
+ extern BOOL decorated_mode;

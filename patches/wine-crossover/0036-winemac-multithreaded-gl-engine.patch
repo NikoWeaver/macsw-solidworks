@@ -1,0 +1,115 @@
+From: MacSW maintainers
+Subject: [PATCH] winemac: Enable Apple's multithreaded GL engine on contexts that present.
+
+SOLIDWORKS draws its model in OpenGL immediate mode (about 475,000 recorded
+calls, 7.6 MB, per frame of a 9-plate assembly). Patch 0030 batches these
+calls into one unix call per buffer; the replay then calls Apple's
+glVertex3fv/glNormal3fv/... one by one, and Apple's GL engine (GLEngine,
+translated by Rosetta) does its own vertex processing on the calling thread.
+
+kCGLCEMPEngine moves that driver work to a worker thread of the GL framework.
+Commands that return data or synchronise (glGet*, glReadPixels,
+glRenderMode, glFinish, flushBuffer) wait for the worker, so results and
+images are the same.
+
+The engine is enabled once per context, when the context first presents to a
+window (front-buffer glFlush, the path SOLIDWORKS uses, or SwapBuffers), while
+it is current on the drawing thread. A first version enabled it at creation
+on every context; in cold starts that made the 9-plate redraw 13 % slower
+(SOLIDWORKS creates more than a dozen GL contexts; helper contexts mostly
+synchronise).
+
+Measured with SOLIDWORKS 2026 SP4.1 on an M2 Pro (docs/gpu-graphics-night.md):
+ * GL time per frame, 14 in-session pairs: batch replay 10.6-12.7 ms ->
+   5.4-7.3 ms, glFlush +0.2-0.9 ms, total -37 %.
+ * 3 interleaved cold-start pairs: 36-plate assembly redraw 0.83 and rotate
+   step 0.85 (paired medians), 9-plate redraw 1.00 and rotate step 0.90;
+   a pair of trivial COM calls 1.14 (slower); SLDWORKS.exe CPU 77 -> 90 % of
+   a core (the GL worker runs on another core).
+ * 8 scenes (assembly, shaded with edges, shaded, selection, section view,
+   36-plate assembly) pixel-identical.
+
+MACSW_GL_MPENGINE=0 turns it off. If CGLEnable fails, the context is used
+without the engine.
+---
+diff --git a/dlls/winemac.drv/opengl.c b/dlls/winemac.drv/opengl.c
+index cbc84fd..ecef4ae 100644
+--- a/dlls/winemac.drv/opengl.c
++++ b/dlls/winemac.drv/opengl.c
+@@ -71,6 +71,7 @@ struct macdrv_context
+     CGLPBufferObj           read_pbuffer;
+     int                     swap_interval;
+     BOOL                    bitmap_initialized;
++    BOOL                    mp_engine_checked;
+ };
+ 
+ struct gl_drawable
+@@ -1412,6 +1413,52 @@ static BOOL init_gl_info(void)
+ }
+ 
+ 
++/**********************************************************************
++ *              use_mp_engine
++ *
++ * MacSW: whether new contexts get Apple's multithreaded GL engine (default on;
++ * MACSW_GL_MPENGINE=0 turns it off).
++ */
++static BOOL use_mp_engine(void)
++{
++    static int enabled = -1;
++
++    if (enabled < 0)
++    {
++        const char *str = getenv("MACSW_GL_MPENGINE");
++        enabled = !(str && str[0] == '0');
++        TRACE("multithreaded GL engine %s\n", enabled ? "on" : "off");
++    }
++    return enabled;
++}
++
++
++/**********************************************************************
++ *              enable_mp_engine
++ *
++ * MacSW: Apple's multithreaded GL engine runs the GL driver's own CPU work (immediate-mode
++ * vertex processing, command encoding) on a worker thread, in parallel with the application
++ * thread.  Commands that return data or synchronize (glGet*, glReadPixels, glFinish,
++ * flushBuffer) still wait for the worker, so the results are the same.  It is enabled when a
++ * context first presents to a window (it is current on this thread then), not when it is
++ * created: offscreen and helper contexts, which mostly synchronize, keep the single-threaded
++ * engine.  MACSW_GL_MPENGINE=0 turns it off.
++ */
++static void enable_mp_engine(struct macdrv_context *context)
++{
++    CGLError err;
++
++    if (context->mp_engine_checked) return;
++    context->mp_engine_checked = TRUE;
++    if (!use_mp_engine()) return;
++    err = CGLEnable(context->cglcontext, kCGLCEMPEngine);
++    if (err != kCGLNoError)
++        WARN("CGLEnable(kCGLCEMPEngine) failed with error %d %s; continuing without it\n", err, CGLErrorString(err));
++    else
++        TRACE("context %p: multithreaded GL engine enabled\n", context);
++}
++
++
+ /**********************************************************************
+  *              create_context
+  */
+@@ -2125,6 +2172,7 @@ static void macdrv_surface_flush(struct opengl_drawable *base, UINT flags)
+     if (flags & GL_FLUSH_UPDATED) make_context_current(context, context->read_view == client->cocoa_view);
+     if (flags & GL_FLUSH_PRESENT)
+     {
++        enable_mp_engine(context);
+         /* win32u has already called glFlush() or glFinish() before asking the
+          * driver to present front-buffer rendering.  flushBuffer swaps a
+          * double-buffered NSOpenGLContext, which replaces the front buffer
+@@ -2988,6 +3036,7 @@ static BOOL macdrv_surface_swap(struct opengl_drawable *base)
+     if (context)
+     {
+         struct macdrv_client_surface *client = impl_from_client_surface(base->client);
++        enable_mp_engine(context);
+         make_context_current(context, context->read_view == client->cocoa_view);
+         macdrv_flush_opengl_context(context->context);
+     }

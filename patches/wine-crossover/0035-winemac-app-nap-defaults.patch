@@ -1,0 +1,47 @@
+From: MacSW maintainers
+Subject: [PATCH] winemac: Register NSAppSleepDisabled so App Nap stays off.
+
+transformProcessToForeground begins an activity with
+NSActivityUserInitiatedAllowingIdleSystemSleep to keep App Nap away from
+every windowed Wine process (unless HKCU\Software\Wine\Mac Driver\EnableAppNap
+is "y"). On macOS 27 that activity no longer does it completely: about 40 s
+after a Wine app stops being the frontmost app, macOS clamps the whole task
+to utility QoS (task base priority 31 -> 20, every thread's maximum priority
+20). SOLIDWORKS then runs a rebuild, an open or the rest of its start-up at
+utility QoS, below every default-QoS thread of the other apps. Measured with
+proc_pid_rusage (per-QoS CPU time) and PROC_PIDTASKINFO (pti_priority):
+ * a native AppKit app with the same activity: clamped to 20 after 40-50 s;
+   with NSActivityLatencyCritical added, or with NSAppSleepDisabled in its
+   defaults (persistent domain, or registered before NSApplication exists):
+   stays at 31; the Info.plist keys NSAppSleepDisabled / LSAppNapIsDisabled
+   do not help; registering the default after NSApplication exists does not
+   help either.
+ * SOLIDWORKS in a clone bottle (shell launch and SOLIDWORKS.app): all 64
+   threads at 20, more than half of the start-up CPU time at utility QoS.
+
+run_cocoa_app() now registers NSAppSleepDisabled = YES in the registration
+domain right before it creates the NSApplication, when App Nap is disabled
+(enable_app_nap false, the default). It acts for every launch path (MacSW,
+SOLIDWORKS.app, a shell) because it does not depend on a bundle identifier;
+the user's own defaults still win over the registration domain.
+Wine 11.16 has the same code without this default.
+Details: docs/cpu-scheduling-night.md.
+
+diff --git a/dlls/winemac.drv/cocoa_main.m b/dlls/winemac.drv/cocoa_main.m
+index 8c9507a..7fd71fa 100644
+--- a/dlls/winemac.drv/cocoa_main.m
++++ b/dlls/winemac.drv/cocoa_main.m
+@@ -70,6 +70,13 @@ static void run_cocoa_app(void* info)
+     {
+         if (!NSApp)
+         {
++            /* MacSW: the NSActivityUserInitiated activity that transformProcessToForeground begins no
++               longer keeps App Nap away completely: macOS 27 clamps a non-frontmost app that holds
++               only that activity to utility QoS (priority 20) after about 40 s.  NSAppSleepDisabled
++               turns App Nap off; it must be registered before the NSApplication exists. */
++            if (!enable_app_nap)
++                [[NSUserDefaults standardUserDefaults] registerDefaults:
++                    [NSDictionary dictionaryWithObject:[NSNumber numberWithBool:YES] forKey:@"NSAppSleepDisabled"]];
+             [WineApplication sharedApplication];
+             created_app = TRUE;
+         }

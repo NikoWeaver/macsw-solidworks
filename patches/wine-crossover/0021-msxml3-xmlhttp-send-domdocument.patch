@@ -1,0 +1,128 @@
+From: MacSW maintainers
+Subject: [PATCH] msxml3: Send IXMLDOMDocument and stream bodies with XMLHTTP.
+
+IXMLHTTPRequest::send() ignored a body that is an object: a DOM document
+(VT_DISPATCH) or a stream (VT_UNKNOWN) logged "unsupported body data type" and
+posted the request with Content-Length: 0. The SOLIDWORKS Activation Wizard
+posts its requests that way, so the licensing server answered every request
+with an error and the wizard reported that it cannot connect.
+
+Serialize a document body with IXMLDOMDocument::save() (UTF-8 unless the XML
+declaration says otherwise) and copy a stream body as is. BSTR and byte-array
+bodies are unchanged. Any other body object now makes send() fail with
+E_NOTIMPL instead of silently posting an empty body.
+
+diff --git a/dlls/msxml3/httprequest.c b/dlls/msxml3/httprequest.c
+index 90be57e..b09e91f 100644
+--- a/dlls/msxml3/httprequest.c
++++ b/dlls/msxml3/httprequest.c
+@@ -673,6 +673,64 @@ static const IAuthenticateVtbl AuthenticateVtbl = {
+     Authenticate_Authenticate
+ };
+ 
++/* Body objects for send(): a DOM document is sent serialized, as
++ * IXMLDOMDocument::save() writes it; a stream is sent as is. */
++static HRESULT get_body_object_data(IUnknown *unk, void **data, LONG *size)
++{
++    ISequentialStream *src = NULL;
++    IXMLDOMDocument *doc;
++    IStream *stream;
++    HGLOBAL hglobal;
++    STATSTG stat;
++    VARIANT dest;
++    char buf[4096];
++    ULONG read;
++    HRESULT hr;
++
++    if (FAILED(hr = CreateStreamOnHGlobal(NULL, TRUE, &stream))) return hr;
++
++    if (unk && IUnknown_QueryInterface(unk, &IID_IXMLDOMDocument, (void **)&doc) == S_OK)
++    {
++        V_VT(&dest) = VT_UNKNOWN;
++        V_UNKNOWN(&dest) = (IUnknown *)stream;
++        hr = IXMLDOMDocument_save(doc, dest);
++        IXMLDOMDocument_Release(doc);
++    }
++    else if (unk && IUnknown_QueryInterface(unk, &IID_ISequentialStream, (void **)&src) == S_OK)
++    {
++        while ((hr = ISequentialStream_Read(src, buf, sizeof(buf), &read)) == S_OK && read)
++            if (FAILED(hr = IStream_Write(stream, buf, read, NULL))) break;
++        if (SUCCEEDED(hr)) hr = S_OK;
++        ISequentialStream_Release(src);
++    }
++    else
++    {
++        FIXME("unsupported body object %p\n", unk);
++        hr = E_NOTIMPL;
++    }
++
++    if (hr == S_OK) hr = IStream_Stat(stream, &stat, STATFLAG_NONAME);
++    if (hr == S_OK) hr = GetHGlobalFromStream(stream, &hglobal);
++    if (hr == S_OK && !(*data = malloc(max(stat.cbSize.LowPart, 1)))) hr = E_OUTOFMEMORY;
++    if (hr == S_OK && (*size = stat.cbSize.LowPart))
++    {
++        void *mem = GlobalLock(hglobal);
++
++        if (mem)
++        {
++            memcpy(*data, mem, *size);
++            GlobalUnlock(hglobal);
++        }
++        else
++        {
++            free(*data);
++            hr = E_OUTOFMEMORY;
++        }
++    }
++    IStream_Release(stream);
++    return hr;
++}
++
+ static HRESULT BindStatusCallback_create(httprequest* This, BindStatusCallback **obj, const VARIANT *body)
+ {
+     BindStatusCallback *bsc;
+@@ -700,6 +758,7 @@ static HRESULT BindStatusCallback_create(httprequest* This, BindStatusCallback *
+     {
+         void *send_data, *ptr;
+         SAFEARRAY *sa = NULL;
++        BOOL free_ptr = FALSE;
+ 
+         if (V_VT(body) == (VT_VARIANT|VT_BYREF))
+             body = V_VARIANTREF(body);
+@@ -729,8 +788,18 @@ static HRESULT BindStatusCallback_create(httprequest* This, BindStatusCallback *
+             }
+             WideCharToMultiByte(cp, 0, str, len, ptr, size, NULL, NULL);
+             if (cp == CP_UTF8) This->use_utf8_content = TRUE;
++            free_ptr = TRUE;
+             break;
+         }
++        case VT_UNKNOWN:
++        case VT_DISPATCH:
++            if ((hr = get_body_object_data(V_UNKNOWN(body), &ptr, &size)) != S_OK)
++            {
++                free(bsc);
++                return hr;
++            }
++            free_ptr = TRUE;
++            break;
+         case VT_ARRAY|VT_UI1:
+         {
+             sa = V_ARRAY(body);
+@@ -764,7 +833,7 @@ static HRESULT BindStatusCallback_create(httprequest* This, BindStatusCallback *
+             bsc->body = GlobalAlloc(GMEM_FIXED, size);
+             if (!bsc->body)
+             {
+-                if (V_VT(body) == VT_BSTR)
++                if (free_ptr)
+                     free(ptr);
+                 else if (V_VT(body) == (VT_ARRAY|VT_UI1))
+                     SafeArrayUnaccessData(sa);
+@@ -778,7 +847,7 @@ static HRESULT BindStatusCallback_create(httprequest* This, BindStatusCallback *
+             GlobalUnlock(bsc->body);
+         }
+ 
+-        if (V_VT(body) == VT_BSTR)
++        if (free_ptr)
+             free(ptr);
+         else if (V_VT(body) == (VT_ARRAY|VT_UI1))
+             SafeArrayUnaccessData(sa);

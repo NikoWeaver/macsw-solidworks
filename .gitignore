@@ -1,0 +1,22 @@
+# Ignore large extracted files, bottles and installation media
+*.iso
+*.zip
+.DS_Store
+bottle
+bottle/
+
+# Temporary logs, captures and artifacts
+scratch/
+/Binary/
+macos/Bootstrap/.build/
+*.png
+*.icns
+macos/Resources/*.icns
+scripts/diagnostics/*.exe
+build/
+dist/
+/.venv/
+__pycache__/
+*.pyc
+*.dll
+resources/*.dll

@@ -1,0 +1,53 @@
+diff --git a/dlls/win32u/dce.c b/dlls/win32u/dce.c
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -2238,2 +2238,29 @@ BOOL WINAPI NtUserPrintWindow( HWND hwnd, HDC hdc, UINT flags )
+     UINT prf_flags = PRF_CHILDREN | PRF_ERASEBKGND | PRF_OWNED | PRF_CLIENT;
++
++    if (compat_printwindow_surface)
++    {
++        RECT rect;
++        HDC source;
++        BOOL ret;
++        DWORD dc_flags = DCX_CACHE;
++
++        /* Capture the already painted window instead of recursively entering
++         * application WM_PRINTCLIENT handlers. SOLIDWORKS initializes its
++         * model-sheet CScrollView during OnPrepareDC, adding a spurious bar. */
++        if (flags & PW_CLIENTONLY)
++        {
++            if (!get_client_rect_rel( hwnd, COORDS_CLIENT, &rect, get_thread_dpi() )) return FALSE;
++        }
++        else
++        {
++            if (!get_window_rect( hwnd, &rect, get_thread_dpi() )) return FALSE;
++            dc_flags |= DCX_WINDOW;
++        }
++        if (!(source = NtUserGetDCEx( hwnd, 0, dc_flags ))) return FALSE;
++        ret = NtGdiBitBlt( hdc, 0, 0, rect.right - rect.left, rect.bottom - rect.top,
++                           source, 0, 0, SRCCOPY, 0, 0 );
++        NtUserReleaseDC( hwnd, source );
++        return ret;
++    }
++
+     if (!(flags & PW_CLIENTONLY)) prf_flags |= PRF_NONCLIENT;
+diff --git a/dlls/win32u/sysparams.c b/dlls/win32u/sysparams.c
+--- a/dlls/win32u/sysparams.c
++++ b/dlls/win32u/sysparams.c
+@@ -170,2 +170,3 @@ static BOOL emulate_modeset;
+ BOOL compat_no_capture_resend;
++BOOL compat_printwindow_surface;
+ UINT64 thunk_lock_callback = 0;
+@@ -6016,3 +6017,5 @@ void sysparams_init(void)
+         if (strstr( app_compat_flags, "WINE_NOCAPTURERESEND" ))
+             compat_no_capture_resend = TRUE;
++        if (strstr( app_compat_flags, "WINE_PRINTWINDOW_SURFACE" ))
++            compat_printwindow_surface = TRUE;
+     }
+diff --git a/dlls/win32u/win32u_private.h b/dlls/win32u/win32u_private.h
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -164,2 +164,3 @@ extern UINT system_dpi;
+ extern BOOL compat_no_capture_resend;
++extern BOOL compat_printwindow_surface;
+ extern BOOL decorated_mode;

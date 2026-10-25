@@ -1,0 +1,49 @@
+diff --git a/dlls/win32u/font.c b/dlls/win32u/font.c
+--- a/dlls/win32u/font.c
++++ b/dlls/win32u/font.c
+@@ -2985,1 +2985,37 @@
++static BOOL font_link_matches_default( const KEY_VALUE_PARTIAL_INFORMATION *info,
++                                       const char *link, DWORD len )
++{
++    const WCHAR *value = (const WCHAR *)info->Data;
++    DWORD i;
++
++    if (!link || info->Type != REG_MULTI_SZ || info->DataLength != len * sizeof(WCHAR)) return FALSE;
++    for (i = 0; i < len; i++)
++        if (value[i] != (unsigned char)link[i]) return FALSE;
++    return TRUE;
++}
++
++static BOOL preserve_custom_font_link( HKEY hkey, const struct system_link_reg *link )
++{
++    KEY_VALUE_PARTIAL_INFORMATION *info;
++    UNICODE_STRING name;
++    NTSTATUS status;
++    ULONG size;
++    BOOL preserve = TRUE;
++
++    RtlInitUnicodeString( &name, link->font_name );
++    status = NtQueryValueKey( hkey, &name, KeyValuePartialInformation, NULL, 0, &size );
++    if (status == STATUS_OBJECT_NAME_NOT_FOUND) return FALSE;
++    if (status != STATUS_BUFFER_TOO_SMALL && status != STATUS_BUFFER_OVERFLOW) return TRUE;
++    if (!(info = malloc( size ))) return TRUE;
++
++    if (!NtQueryValueKey( hkey, &name, KeyValuePartialInformation, info, size, &size ))
++        preserve = !(font_link_matches_default( info, link->link_non_cjk, link->link_non_cjk_len ) ||
++                     font_link_matches_default( info, link->link_sc, link->link_sc_len ) ||
++                     font_link_matches_default( info, link->link_tc, link->link_tc_len ) ||
++                     font_link_matches_default( info, link->link_jp, link->link_jp_len ) ||
++                     font_link_matches_default( info, link->link_kr, link->link_kr_len ));
++    free( info );
++    return preserve;
++}
++
+ static void update_font_system_link_info(void)
+@@ -2996,3 +3032,7 @@
+             const struct system_link_reg *link_reg = &default_system_link[i];
+ 
++            /* Codepage changes may replace Wine defaults, but not user supplied
++             * fallback lists, their ordering, or intentionally empty values. */
++            if (preserve_custom_font_link( hkey, link_reg )) continue;
++
+             link = link_reg->link_non_cjk;

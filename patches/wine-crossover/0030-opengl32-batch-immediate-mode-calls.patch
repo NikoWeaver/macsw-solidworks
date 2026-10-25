@@ -1,0 +1,516 @@
+From: MacSW maintainers
+Subject: [PATCH] opengl32: Batch immediate-mode calls into one unix call (x86_64).
+
+Every OpenGL call of the PE opengl32.dll is a unix call. On macOS the unix
+call dispatcher switches the gs base twice per call (_thread_set_tsd_base),
+which costs about 0.16 us each under Rosetta 2, so one glVertex3fv costs
+about 0.44 us. SOLIDWORKS draws its model in immediate mode: about 585,000
+glVertex3fv/glNormal3fv/glBegin/glEnd calls per redraw of a 9-part test
+assembly, which took about 300 ms per redraw.
+
+The PE side now records glBegin, glEnd, glVertex2f/3f/3d, glNormal3f/3d,
+glColor3f/4f and glTexCoord2f/2d (and their v forms) in a 64 KB per-thread
+buffer (TEB glReserved1[6]). None of them returns a value or reads state.
+The new unix call macsw_gl_batch replays the buffer with the same driver
+functions. Every other unix call of opengl32 (all generated thunks and
+wgl.c, through UNIX_CALL) flushes the buffer first, and so does thread
+detach, so the GL command order is unchanged and every query, glGetError,
+glFlush/glFinish, SwapBuffers, wglMakeCurrent, display list compile and
+selection/feedback result sees all earlier commands. Installing a GL debug
+message callback turns batching off for the process, so that a synchronous
+debug message is still reported from the call that caused it. The unix
+side checks every record against the buffer size.
+
+The unix call is appended to both call tables, so the existing indices
+stay the same; the 32-bit PE side does not batch. MACSW_GL_BATCH=0 in the
+environment turns batching off.
+
+Measured with SOLIDWORKS 2026 (docs/graphics-performance.md).
+
+diff --git a/dlls/opengl32/private.h b/dlls/opengl32/private.h
+index ca7132d..8ed0425 100644
+--- a/dlls/opengl32/private.h
++++ b/dlls/opengl32/private.h
+@@ -20,6 +20,7 @@
+ 
+ #include <stdarg.h>
+ #include <stddef.h>
++#include <string.h>
+ 
+ #include "ntstatus.h"
+ #include "windef.h"
+@@ -79,4 +80,52 @@ extern BOOL alloc_context_objects( enum object_type type, UINT n, const GLuint *
+ extern GLuint *del_context_objects( enum object_type type, UINT n, GLuint *handles );
+ extern GLuint *map_context_objects( enum object_type type, UINT n, GLuint *handles );
+ 
++/* MacSW: every unix call costs two gs base switches (about 0.33 us under Rosetta). Immediate-mode
++ * calls (glBegin, glVertex*, glNormal*, ...) are recorded in a per-thread buffer and replayed by
++ * one unix call. Any other unix call flushes the buffer first, so the order of GL commands is kept
++ * and every query, glGetError, glFlush/glFinish, SwapBuffers and context change sees all earlier
++ * commands. Installing a GL debug message callback turns batching off for the process, so that
++ * synchronous debug messages are still reported at the call that caused them.
++ * MACSW_GL_BATCH=0 in the environment turns this off. */
++#ifdef _WIN64
++#define WINE_GL_RESERVED_BATCH 6
++
++struct gl_batch
++{
++    UINT32 size;
++    BYTE data[65536 - sizeof(UINT32)];
++};
++
++extern LONG gl_batch_enabled;  /* -1: MACSW_GL_BATCH not read yet, 0: off, 1: on */
++extern struct gl_batch *gl_batch_init(void);
++extern void gl_batch_flush_now( struct gl_batch *batch );
++extern void gl_batch_disable(void);
++
++static inline void gl_batch_flush(void)
++{
++    struct gl_batch *batch = NtCurrentTeb()->glReserved1[WINE_GL_RESERVED_BATCH];
++    if (batch && batch->size) gl_batch_flush_now( batch );
++}
++
++static inline BOOL gl_batch_put( UINT32 op, const void *data, UINT32 size )
++{
++    struct gl_batch *batch = NtCurrentTeb()->glReserved1[WINE_GL_RESERVED_BATCH];
++    BYTE *ptr;
++
++    if (!gl_batch_enabled) return FALSE;
++    if (!batch && !(batch = gl_batch_init())) return FALSE;
++    if (batch->size + sizeof(op) + size > sizeof(batch->data)) gl_batch_flush_now( batch );
++    ptr = batch->data + batch->size;
++    memcpy( ptr, &op, sizeof(op) );
++    if (size) memcpy( ptr + sizeof(op), data, size );
++    batch->size += sizeof(op) + size;
++    return TRUE;
++}
++
++#undef UNIX_CALL
++#define UNIX_CALL( func, params ) (gl_batch_flush(), WINE_UNIX_CALL( unix_ ## func, params ))
++#else
++static inline BOOL gl_batch_put( UINT32 op, const void *data, UINT32 size ) { return FALSE; }
++#endif
++
+ #endif /* __WINE_OPENGL32_PRIVATE_H */
+diff --git a/dlls/opengl32/thunks.c b/dlls/opengl32/thunks.c
+index 66d6281..c3cbc2a 100644
+--- a/dlls/opengl32/thunks.c
++++ b/dlls/opengl32/thunks.c
+@@ -73,6 +73,7 @@ void WINAPI glBegin( GLenum mode )
+     struct glBegin_params args = { .teb = NtCurrentTeb(), .mode = mode };
+     NTSTATUS status;
+     TRACE( "mode %d\n", mode );
++    if (gl_batch_put( GL_BATCH_BEGIN, &mode, sizeof(mode) )) return;
+     if ((status = UNIX_CALL( glBegin, &args ))) WARN( "glBegin returned %#lx\n", status );
+     set_context_attribute( -1 /* unsupported */, NULL, 0 );
+ }
+@@ -229,6 +230,10 @@ void WINAPI glColor3f( GLfloat red, GLfloat green, GLfloat blue )
+     struct glColor3f_params args = { .teb = NtCurrentTeb(), .red = red, .green = green, .blue = blue };
+     NTSTATUS status;
+     TRACE( "red %f, green %f, blue %f\n", red, green, blue );
++    {
++        GLfloat v[3] = { red, green, blue };
++        if (gl_batch_put( GL_BATCH_COLOR3F, v, sizeof(v) )) return;
++    }
+     if ((status = UNIX_CALL( glColor3f, &args ))) WARN( "glColor3f returned %#lx\n", status );
+     set_context_attribute( -1 /* unsupported */, NULL, 0 );
+ }
+@@ -238,6 +243,7 @@ void WINAPI glColor3fv( const GLfloat *v )
+     struct glColor3fv_params args = { .teb = NtCurrentTeb(), .v = v };
+     NTSTATUS status;
+     TRACE( "v %p\n", v );
++    if (gl_batch_put( GL_BATCH_COLOR3F, v, 3 * sizeof(*v) )) return;
+     if ((status = UNIX_CALL( glColor3fv, &args ))) WARN( "glColor3fv returned %#lx\n", status );
+     set_context_attribute( -1 /* unsupported */, NULL, 0 );
+ }
+@@ -373,6 +379,10 @@ void WINAPI glColor4f( GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha )
+     struct glColor4f_params args = { .teb = NtCurrentTeb(), .red = red, .green = green, .blue = blue, .alpha = alpha };
+     NTSTATUS status;
+     TRACE( "red %f, green %f, blue %f, alpha %f\n", red, green, blue, alpha );
++    {
++        GLfloat v[4] = { red, green, blue, alpha };
++        if (gl_batch_put( GL_BATCH_COLOR4F, v, sizeof(v) )) return;
++    }
+     if ((status = UNIX_CALL( glColor4f, &args ))) WARN( "glColor4f returned %#lx\n", status );
+     set_context_attribute( -1 /* unsupported */, NULL, 0 );
+ }
+@@ -382,6 +392,7 @@ void WINAPI glColor4fv( const GLfloat *v )
+     struct glColor4fv_params args = { .teb = NtCurrentTeb(), .v = v };
+     NTSTATUS status;
+     TRACE( "v %p\n", v );
++    if (gl_batch_put( GL_BATCH_COLOR4F, v, 4 * sizeof(*v) )) return;
+     if ((status = UNIX_CALL( glColor4fv, &args ))) WARN( "glColor4fv returned %#lx\n", status );
+     set_context_attribute( -1 /* unsupported */, NULL, 0 );
+ }
+@@ -711,6 +722,7 @@ void WINAPI glEnd(void)
+     struct glEnd_params args = { .teb = NtCurrentTeb() };
+     NTSTATUS status;
+     TRACE( "\n" );
++    if (gl_batch_put( GL_BATCH_END, NULL, 0 )) return;
+     if ((status = UNIX_CALL( glEnd, &args ))) WARN( "glEnd returned %#lx\n", status );
+     set_context_attribute( -1 /* unsupported */, NULL, 0 );
+ }
+@@ -1651,6 +1663,10 @@ void WINAPI glNormal3d( GLdouble nx, GLdouble ny, GLdouble nz )
+     struct glNormal3d_params args = { .teb = NtCurrentTeb(), .nx = nx, .ny = ny, .nz = nz };
+     NTSTATUS status;
+     TRACE( "nx %f, ny %f, nz %f\n", nx, ny, nz );
++    {
++        GLdouble v[3] = { nx, ny, nz };
++        if (gl_batch_put( GL_BATCH_NORMAL3D, v, sizeof(v) )) return;
++    }
+     if ((status = UNIX_CALL( glNormal3d, &args ))) WARN( "glNormal3d returned %#lx\n", status );
+     set_context_attribute( -1 /* unsupported */, NULL, 0 );
+ }
+@@ -1660,6 +1676,7 @@ void WINAPI glNormal3dv( const GLdouble *v )
+     struct glNormal3dv_params args = { .teb = NtCurrentTeb(), .v = v };
+     NTSTATUS status;
+     TRACE( "v %p\n", v );
++    if (gl_batch_put( GL_BATCH_NORMAL3D, v, 3 * sizeof(*v) )) return;
+     if ((status = UNIX_CALL( glNormal3dv, &args ))) WARN( "glNormal3dv returned %#lx\n", status );
+     set_context_attribute( -1 /* unsupported */, NULL, 0 );
+ }
+@@ -1669,6 +1686,10 @@ void WINAPI glNormal3f( GLfloat nx, GLfloat ny, GLfloat nz )
+     struct glNormal3f_params args = { .teb = NtCurrentTeb(), .nx = nx, .ny = ny, .nz = nz };
+     NTSTATUS status;
+     TRACE( "nx %f, ny %f, nz %f\n", nx, ny, nz );
++    {
++        GLfloat v[3] = { nx, ny, nz };
++        if (gl_batch_put( GL_BATCH_NORMAL3F, v, sizeof(v) )) return;
++    }
+     if ((status = UNIX_CALL( glNormal3f, &args ))) WARN( "glNormal3f returned %#lx\n", status );
+     set_context_attribute( -1 /* unsupported */, NULL, 0 );
+ }
+@@ -1678,6 +1699,7 @@ void WINAPI glNormal3fv( const GLfloat *v )
+     struct glNormal3fv_params args = { .teb = NtCurrentTeb(), .v = v };
+     NTSTATUS status;
+     TRACE( "v %p\n", v );
++    if (gl_batch_put( GL_BATCH_NORMAL3F, v, 3 * sizeof(*v) )) return;
+     if ((status = UNIX_CALL( glNormal3fv, &args ))) WARN( "glNormal3fv returned %#lx\n", status );
+     set_context_attribute( -1 /* unsupported */, NULL, 0 );
+ }
+@@ -2421,6 +2443,10 @@ void WINAPI glTexCoord2d( GLdouble s, GLdouble t )
+     struct glTexCoord2d_params args = { .teb = NtCurrentTeb(), .s = s, .t = t };
+     NTSTATUS status;
+     TRACE( "s %f, t %f\n", s, t );
++    {
++        GLdouble v[2] = { s, t };
++        if (gl_batch_put( GL_BATCH_TEXCOORD2D, v, sizeof(v) )) return;
++    }
+     if ((status = UNIX_CALL( glTexCoord2d, &args ))) WARN( "glTexCoord2d returned %#lx\n", status );
+     set_context_attribute( -1 /* unsupported */, NULL, 0 );
+ }
+@@ -2439,6 +2465,10 @@ void WINAPI glTexCoord2f( GLfloat s, GLfloat t )
+     struct glTexCoord2f_params args = { .teb = NtCurrentTeb(), .s = s, .t = t };
+     NTSTATUS status;
+     TRACE( "s %f, t %f\n", s, t );
++    {
++        GLfloat v[2] = { s, t };
++        if (gl_batch_put( GL_BATCH_TEXCOORD2F, v, sizeof(v) )) return;
++    }
+     if ((status = UNIX_CALL( glTexCoord2f, &args ))) WARN( "glTexCoord2f returned %#lx\n", status );
+     set_context_attribute( -1 /* unsupported */, NULL, 0 );
+ }
+@@ -2448,6 +2478,7 @@ void WINAPI glTexCoord2fv( const GLfloat *v )
+     struct glTexCoord2fv_params args = { .teb = NtCurrentTeb(), .v = v };
+     NTSTATUS status;
+     TRACE( "v %p\n", v );
++    if (gl_batch_put( GL_BATCH_TEXCOORD2F, v, 2 * sizeof(*v) )) return;
+     if ((status = UNIX_CALL( glTexCoord2fv, &args ))) WARN( "glTexCoord2fv returned %#lx\n", status );
+     set_context_attribute( -1 /* unsupported */, NULL, 0 );
+ }
+@@ -2844,6 +2875,10 @@ void WINAPI glVertex2f( GLfloat x, GLfloat y )
+     struct glVertex2f_params args = { .teb = NtCurrentTeb(), .x = x, .y = y };
+     NTSTATUS status;
+     TRACE( "x %f, y %f\n", x, y );
++    {
++        GLfloat v[2] = { x, y };
++        if (gl_batch_put( GL_BATCH_VERTEX2F, v, sizeof(v) )) return;
++    }
+     if ((status = UNIX_CALL( glVertex2f, &args ))) WARN( "glVertex2f returned %#lx\n", status );
+     set_context_attribute( -1 /* unsupported */, NULL, 0 );
+ }
+@@ -2853,6 +2888,7 @@ void WINAPI glVertex2fv( const GLfloat *v )
+     struct glVertex2fv_params args = { .teb = NtCurrentTeb(), .v = v };
+     NTSTATUS status;
+     TRACE( "v %p\n", v );
++    if (gl_batch_put( GL_BATCH_VERTEX2F, v, 2 * sizeof(*v) )) return;
+     if ((status = UNIX_CALL( glVertex2fv, &args ))) WARN( "glVertex2fv returned %#lx\n", status );
+     set_context_attribute( -1 /* unsupported */, NULL, 0 );
+ }
+@@ -2898,6 +2934,10 @@ void WINAPI glVertex3d( GLdouble x, GLdouble y, GLdouble z )
+     struct glVertex3d_params args = { .teb = NtCurrentTeb(), .x = x, .y = y, .z = z };
+     NTSTATUS status;
+     TRACE( "x %f, y %f, z %f\n", x, y, z );
++    {
++        GLdouble v[3] = { x, y, z };
++        if (gl_batch_put( GL_BATCH_VERTEX3D, v, sizeof(v) )) return;
++    }
+     if ((status = UNIX_CALL( glVertex3d, &args ))) WARN( "glVertex3d returned %#lx\n", status );
+     set_context_attribute( -1 /* unsupported */, NULL, 0 );
+ }
+@@ -2907,6 +2947,7 @@ void WINAPI glVertex3dv( const GLdouble *v )
+     struct glVertex3dv_params args = { .teb = NtCurrentTeb(), .v = v };
+     NTSTATUS status;
+     TRACE( "v %p\n", v );
++    if (gl_batch_put( GL_BATCH_VERTEX3D, v, 3 * sizeof(*v) )) return;
+     if ((status = UNIX_CALL( glVertex3dv, &args ))) WARN( "glVertex3dv returned %#lx\n", status );
+     set_context_attribute( -1 /* unsupported */, NULL, 0 );
+ }
+@@ -2916,6 +2957,10 @@ void WINAPI glVertex3f( GLfloat x, GLfloat y, GLfloat z )
+     struct glVertex3f_params args = { .teb = NtCurrentTeb(), .x = x, .y = y, .z = z };
+     NTSTATUS status;
+     TRACE( "x %f, y %f, z %f\n", x, y, z );
++    {
++        GLfloat v[3] = { x, y, z };
++        if (gl_batch_put( GL_BATCH_VERTEX3F, v, sizeof(v) )) return;
++    }
+     if ((status = UNIX_CALL( glVertex3f, &args ))) WARN( "glVertex3f returned %#lx\n", status );
+     set_context_attribute( -1 /* unsupported */, NULL, 0 );
+ }
+@@ -2925,6 +2970,7 @@ void WINAPI glVertex3fv( const GLfloat *v )
+     struct glVertex3fv_params args = { .teb = NtCurrentTeb(), .v = v };
+     NTSTATUS status;
+     TRACE( "v %p\n", v );
++    if (gl_batch_put( GL_BATCH_VERTEX3F, v, 3 * sizeof(*v) )) return;
+     if ((status = UNIX_CALL( glVertex3fv, &args ))) WARN( "glVertex3fv returned %#lx\n", status );
+     set_context_attribute( -1 /* unsupported */, NULL, 0 );
+ }
+@@ -6383,6 +6429,9 @@ static void WINAPI glDebugMessageCallback( GLDEBUGPROC callback, const void *use
+     struct glDebugMessageCallback_params args = { .teb = NtCurrentTeb(), .callback = callback, .userParam = userParam };
+     NTSTATUS status;
+     TRACE( "callback %p, userParam %p\n", callback, userParam );
++#ifdef _WIN64
++    if (callback) gl_batch_disable();
++#endif
+     if ((status = UNIX_CALL( glDebugMessageCallback, &args ))) WARN( "glDebugMessageCallback returned %#lx\n", status );
+     set_context_attribute( -1 /* unsupported */, NULL, 0 );
+ }
+@@ -6392,6 +6441,9 @@ static void WINAPI glDebugMessageCallbackAMD( GLDEBUGPROCAMD callback, void *use
+     struct glDebugMessageCallbackAMD_params args = { .teb = NtCurrentTeb(), .callback = callback, .userParam = userParam };
+     NTSTATUS status;
+     TRACE( "callback %p, userParam %p\n", callback, userParam );
++#ifdef _WIN64
++    if (callback) gl_batch_disable();
++#endif
+     if ((status = UNIX_CALL( glDebugMessageCallbackAMD, &args ))) WARN( "glDebugMessageCallbackAMD returned %#lx\n", status );
+     set_context_attribute( -1 /* unsupported */, NULL, 0 );
+ }
+@@ -6401,6 +6453,9 @@ static void WINAPI glDebugMessageCallbackARB( GLDEBUGPROCARB callback, const voi
+     struct glDebugMessageCallbackARB_params args = { .teb = NtCurrentTeb(), .callback = callback, .userParam = userParam };
+     NTSTATUS status;
+     TRACE( "callback %p, userParam %p\n", callback, userParam );
++#ifdef _WIN64
++    if (callback) gl_batch_disable();
++#endif
+     if ((status = UNIX_CALL( glDebugMessageCallbackARB, &args ))) WARN( "glDebugMessageCallbackARB returned %#lx\n", status );
+     set_context_attribute( -1 /* unsupported */, NULL, 0 );
+ }
+diff --git a/dlls/opengl32/unix_private.h b/dlls/opengl32/unix_private.h
+index ba3ffb2..d78e814 100644
+--- a/dlls/opengl32/unix_private.h
++++ b/dlls/opengl32/unix_private.h
+@@ -89,6 +89,10 @@ extern NTSTATUS process_attach( void *args );
+ extern NTSTATUS thread_attach( void *args );
+ extern NTSTATUS process_detach( void *args );
+ extern NTSTATUS get_pixel_formats( void *args );
++extern NTSTATUS macsw_gl_batch( void *args );
++#ifdef _WIN64
++extern NTSTATUS wow64_macsw_gl_batch( void *args );
++#endif
+ extern void set_current_fbo( TEB *teb, GLenum target, GLuint framebuffer );
+ extern GLuint get_default_fbo( TEB *teb, GLenum target );
+ extern void push_default_fbo( TEB *teb );
+diff --git a/dlls/opengl32/unix_thunks.c b/dlls/opengl32/unix_thunks.c
+index 5c8d434..9f9586a 100644
+--- a/dlls/opengl32/unix_thunks.c
++++ b/dlls/opengl32/unix_thunks.c
+@@ -31021,6 +31021,7 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
+     ext_wglSetPbufferAttribARB,
+     ext_wglSetPixelFormatWINE,
+     ext_wglSwapIntervalEXT,
++    macsw_gl_batch,
+ };
+ 
+ C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == funcs_count);
+@@ -84668,6 +84669,7 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
+     wow64_ext_wglSetPbufferAttribARB,
+     wow64_ext_wglSetPixelFormatWINE,
+     wow64_ext_wglSwapIntervalEXT,
++    wow64_macsw_gl_batch,
+ };
+ 
+ C_ASSERT(ARRAYSIZE(__wine_unix_call_wow64_funcs) == funcs_count);
+diff --git a/dlls/opengl32/unix_wgl.c b/dlls/opengl32/unix_wgl.c
+index d6d0717..6d9ae6a 100644
+--- a/dlls/opengl32/unix_wgl.c
++++ b/dlls/opengl32/unix_wgl.c
+@@ -1528,8 +1528,64 @@ NTSTATUS get_pixel_formats( void *args )
+     return STATUS_SUCCESS;
+ }
+ 
++/* MacSW: replay a buffer of immediate-mode calls recorded by the PE side (see opengl32 private.h).
++ * Every unix call costs two gs base switches (_thread_set_tsd_base, about 0.16 us each under
++ * Rosetta), so one call per buffer instead of one per vertex. */
++NTSTATUS macsw_gl_batch( void *args )
++{
++    const struct macsw_gl_batch_params *params = args;
++    const struct opengl_funcs *funcs = params->teb->glTable;
++    const BYTE *ptr = params->data, *end = ptr + params->size;
++    UINT32 op = 0;
++
++#define BATCH_CALL( func, type, count ) \
++    do { type v[count]; if (end - ptr < sizeof(v)) goto truncated; memcpy( v, ptr, sizeof(v) ); ptr += sizeof(v); \
++         if (funcs->p_##func) funcs->p_##func( v ); } while (0)
++
++    while (end - ptr >= sizeof(op))
++    {
++        memcpy( &op, ptr, sizeof(op) );
++        ptr += sizeof(op);
++        switch (op)
++        {
++        case GL_BATCH_BEGIN:
++        {
++            GLenum mode;
++            if (end - ptr < sizeof(mode)) goto truncated;
++            memcpy( &mode, ptr, sizeof(mode) );
++            ptr += sizeof(mode);
++            if (funcs->p_glBegin) funcs->p_glBegin( mode );
++            break;
++        }
++        case GL_BATCH_END: if (funcs->p_glEnd) funcs->p_glEnd(); break;
++        case GL_BATCH_VERTEX2F: BATCH_CALL( glVertex2fv, GLfloat, 2 ); break;
++        case GL_BATCH_VERTEX3F: BATCH_CALL( glVertex3fv, GLfloat, 3 ); break;
++        case GL_BATCH_VERTEX3D: BATCH_CALL( glVertex3dv, GLdouble, 3 ); break;
++        case GL_BATCH_NORMAL3F: BATCH_CALL( glNormal3fv, GLfloat, 3 ); break;
++        case GL_BATCH_NORMAL3D: BATCH_CALL( glNormal3dv, GLdouble, 3 ); break;
++        case GL_BATCH_COLOR3F: BATCH_CALL( glColor3fv, GLfloat, 3 ); break;
++        case GL_BATCH_COLOR4F: BATCH_CALL( glColor4fv, GLfloat, 4 ); break;
++        case GL_BATCH_TEXCOORD2F: BATCH_CALL( glTexCoord2fv, GLfloat, 2 ); break;
++        case GL_BATCH_TEXCOORD2D: BATCH_CALL( glTexCoord2dv, GLdouble, 2 ); break;
++        default:
++            ERR( "invalid batch op %u\n", op );
++            return STATUS_INVALID_PARAMETER;
++        }
++    }
++#undef BATCH_CALL
++    if (ptr == end) return STATUS_SUCCESS;
++truncated:
++    ERR( "truncated batch op %u\n", op );
++    return STATUS_INVALID_PARAMETER;
++}
++
+ #ifdef _WIN64
+ 
++NTSTATUS wow64_macsw_gl_batch( void *args )
++{
++    return STATUS_NOT_IMPLEMENTED;  /* the 32-bit PE side never batches */
++}
++
+ static pthread_mutex_t wgl_lock = PTHREAD_MUTEX_INITIALIZER;
+ 
+ struct wow64_string_entry
+diff --git a/dlls/opengl32/unixlib.h b/dlls/opengl32/unixlib.h
+index beb6384..71783b4 100644
+--- a/dlls/opengl32/unixlib.h
++++ b/dlls/opengl32/unixlib.h
+@@ -25776,6 +25776,29 @@ struct get_pixel_formats_params
+     unsigned int num_onscreen_formats;
+ };
+ 
++/* MacSW: immediate-mode calls recorded by the PE side and replayed by one unix call */
++enum macsw_gl_batch_op
++{
++    GL_BATCH_BEGIN = 1,
++    GL_BATCH_END,
++    GL_BATCH_VERTEX2F,
++    GL_BATCH_VERTEX3F,
++    GL_BATCH_VERTEX3D,
++    GL_BATCH_NORMAL3F,
++    GL_BATCH_NORMAL3D,
++    GL_BATCH_COLOR3F,
++    GL_BATCH_COLOR4F,
++    GL_BATCH_TEXCOORD2F,
++    GL_BATCH_TEXCOORD2D,
++};
++
++struct macsw_gl_batch_params
++{
++    TEB *teb;
++    const void *data;
++    UINT32 size;
++};
++
+ enum unix_funcs
+ {
+     unix_process_attach,
+@@ -28872,6 +28895,7 @@ enum unix_funcs
+     unix_wglSetPbufferAttribARB,
+     unix_wglSetPixelFormatWINE,
+     unix_wglSwapIntervalEXT,
++    unix_macsw_gl_batch,
+     funcs_count
+ };
+ 
+diff --git a/dlls/opengl32/wgl.c b/dlls/opengl32/wgl.c
+index 142e82f..b813713 100644
+--- a/dlls/opengl32/wgl.c
++++ b/dlls/opengl32/wgl.c
+@@ -1174,6 +1174,46 @@ void set_context_attribute( GLenum name, const void *value, size_t size )
+     }
+ }
+ 
++#ifdef _WIN64
++LONG gl_batch_enabled = -1;
++
++struct gl_batch *gl_batch_init(void)
++{
++    struct gl_batch *batch;
++
++    if (gl_batch_enabled < 0)
++    {
++        WCHAR buf[8];
++        BOOL off = GetEnvironmentVariableW( L"MACSW_GL_BATCH", buf, ARRAY_SIZE(buf) ) && buf[0] == '0';
++        InterlockedCompareExchange( &gl_batch_enabled, !off, -1 );
++        TRACE( "immediate-mode batching %s\n", gl_batch_enabled ? "on" : "off" );
++    }
++    if (gl_batch_enabled <= 0 || !(batch = malloc( sizeof(*batch) ))) return NULL;
++    batch->size = 0;
++    NtCurrentTeb()->glReserved1[WINE_GL_RESERVED_BATCH] = batch;
++    return batch;
++}
++
++void gl_batch_flush_now( struct gl_batch *batch )
++{
++    struct macsw_gl_batch_params args = { .teb = NtCurrentTeb(), .data = batch->data, .size = batch->size };
++    NTSTATUS status;
++
++    batch->size = 0;
++    if ((status = WINE_UNIX_CALL( unix_macsw_gl_batch, &args ))) WARN( "batch returned %#lx\n", status );
++    set_context_attribute( -1 /* unsupported */, NULL, 0 );
++}
++
++/* A debug message callback can be called synchronously from the GL call that caused the message;
++ * a recorded call would report it later, from the flush. Pending calls of other threads are still
++ * flushed by their next unix call. */
++void gl_batch_disable(void)
++{
++    if (gl_batch_enabled) TRACE( "debug message callback installed, immediate-mode batching off\n" );
++    InterlockedExchange( &gl_batch_enabled, 0 );
++}
++#endif
++
+ /***********************************************************************
+  *      wglCopyContext
+  */
+@@ -3113,6 +3153,11 @@ BOOL WINAPI DllMain( HINSTANCE hinst, DWORD reason, LPVOID reserved )
+ #endif
+         /* fallthrough */
+     case DLL_THREAD_DETACH:
++#ifdef _WIN64
++        gl_batch_flush();
++        free( NtCurrentTeb()->glReserved1[WINE_GL_RESERVED_BATCH] );
++        NtCurrentTeb()->glReserved1[WINE_GL_RESERVED_BATCH] = NULL;
++#endif
+         if ((context = get_current_context())) context->base.current_tid = 0;
+         free( NtCurrentTeb()->glReserved1[WINE_GL_RESERVED_FORMATS_PTR] );
+         return TRUE;

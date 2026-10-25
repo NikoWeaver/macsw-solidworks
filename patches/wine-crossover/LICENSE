@@ -1,0 +1,13 @@
+The patches in this directory modify or derive from Wine source code. They are
+licensed under the GNU Lesser General Public License, version 2.1 or (at your
+option) any later version, consistently with the Wine source they modify.
+
+Wine copyright notices remain with their respective copyright holders.
+
+The complete LGPL-2.1 license text is available in Wine's COPYING.LIB file and
+at:
+
+https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html
+
+The Apache-2.0 license in the repository root applies to MacSW's original code,
+not to these Wine-derived patches.

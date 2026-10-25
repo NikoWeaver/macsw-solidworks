@@ -1,0 +1,33 @@
+From: MacSW maintainers
+Subject: [PATCH] msxml3: Serialise empty elements with an explicit end tag, as native MSXML does.
+
+Native MSXML writes an empty element as "<tag></tag>", never as the
+self-closing form "<tag/>" that node_dump() produced. The SOLIDWORKS Activation
+Wizard computes the <CheckSum> of its request over the MSXML (expanded)
+serialisation but writes the request with this routine, so the saved request
+differed from the checksummed form and the licensing server answered
+"Bad Checksum". Emit "<tag></tag>" for an element without children.
+
+diff --git a/dlls/msxml3/node.c b/dlls/msxml3/node.c
+--- a/dlls/msxml3/node.c
++++ b/dlls/msxml3/node.c
+@@ -2051,7 +2051,18 @@
+             node_dump_element_attributes(context, node);
+             if (list_empty(&node->children))
+             {
+-                node_dump_append(context, L"/>", 2);
++                /* Native MSXML always serialises an empty element with an
++                 * explicit start/end tag pair ("<tag></tag>"), never the XML
++                 * self-closing form ("<tag/>") that libxml2-style writers use.
++                 * SOLIDWORKS' Activation Wizard computes the request <CheckSum>
++                 * over the MSXML (expanded) serialisation but writes the file
++                 * with this routine; emitting "<tag/>" makes the saved request
++                 * differ from the checksummed form, so Dassault's activation
++                 * server rejects it as "edited or incomplete".  Match MSXML. */
++                node_dump_append(context, L">", 1);
++                node_dump_append(context, L"</", 2);
++                node_dump_qualified_name(context, node);
++                node_dump_append(context, L">", 1);
+             }
+             else
+             {

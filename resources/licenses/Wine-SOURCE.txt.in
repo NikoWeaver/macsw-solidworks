@@ -1,0 +1,48 @@
+MacSW @APP_RELEASE@ (build @APP_BUILD@): where to get the source code
+
+This app contains software under the GNU Lesser General Public License (LGPL):
+Wine @WINE_VERSION@ and MacSW's changes to Wine, Wine-Mono, 7-Zip and some of the
+libraries in Contents/Resources/Wine/lib. You can get the complete source code
+that corresponds to this build, and you can change it and build it again under
+the terms of those licences. THIRD_PARTY_NOTICES.txt lists every part, its
+licence and the licence texts. Wine is licensed under the LGPL, version 2.1 or
+later; a copy is in Contents/Resources/licenses/Wine/LGPL-2.1.txt.
+
+1. MacSW, with its Wine patches
+   This build was made from MacSW source commit:
+   @GIT_COMMIT@
+   That source tree holds the Wine patches (patches/wine-crossover), the
+   script that applies them and builds the changed Wine modules
+   (scripts/build_winemac.sh), and the scripts that package this app.
+   It is in MacSW-@APP_RELEASE@-source.tar.gz (see "How to get these files").
+@MACSW_SOURCE_ONLINE@
+@MACSW_SOURCE_TAG@
+
+2. Wine, the upstream source archive that the patches apply to:
+   @WINE_SOURCE_URL@
+   SHA-256: @WINE_SOURCE_SHA256@
+
+3. The Wine runtime that this app is based on (Gcenx build):
+   @WINE_RUNTIME_URL@
+   SHA-256: @WINE_RUNTIME_SHA256@
+   The libraries in Contents/Resources/Wine/lib come from it unchanged. Its
+   build recipes are at https://github.com/Gcenx/macOS_Wine_builds.
+   The source archives of the libraries in it that are under the LGPL
+   (GnuTLS, Nettle, GMP, libtasn1, libunistring, libidn2, libiconv and
+   gettext's libintl), in the versions of this build:
+@LGPL_SOURCES@
+
+4. Wine-Mono: see Contents/Resources/licenses/Mono/SOURCE.txt.
+
+5. 7-Zip @SEVEN_Z_VERSION@ (Contents/MacOS/7zz, unchanged):
+   @SEVEN_Z_SOURCE_URL@
+   SHA-256: @SEVEN_Z_SOURCE_SHA256@
+
+How to get these files
+Each MacSW release is published together with its source files: the source
+archive of the commit in item 1 (MacSW-@APP_RELEASE@-source.tar.gz), the Wine
+archive of item 2, the library archives of item 3, the Mono source archive
+named in item 4 and the 7-Zip archive of item 5. For a team release, they are
+also in the team's Box folder, MacSW/releases, next to the DMG. Use that copy
+if you cannot open the repository in item 1. If you cannot find them, ask the
+person who gave you MacSW for a copy.

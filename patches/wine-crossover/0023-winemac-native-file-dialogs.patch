@@ -1,0 +1,1433 @@
+From: MacSW maintainers
+Subject: [PATCH] winemac.drv: Show NSOpenPanel/NSSavePanel for comdlg32 (native file dialogs).
+
+MacSW lets Windows programs use the macOS file panels (patch 0024 makes
+comdlg32 use them when MACSW_NATIVE_FILE_DIALOGS=1). This patch is the
+driver side:
+
+- cocoa_filedialog.m runs an NSOpenPanel/NSSavePanel described by a JSON
+  request: title, prompt, start folder, file name, the Windows filters as a
+  "Format" popup (open panels grey out non-matching files; save panels also
+  get allowedFileTypes so NSSavePanel appends the extension before its own
+  overwrite prompt), multi-select, folder picking, and an accessory view
+  with the IFileDialogCustomize controls (check boxes, combo boxes, radio
+  lists, text, edit boxes, separators, push buttons, menus, visual groups).
+  The panel is a sheet on the owner's Cocoa window when it is on screen,
+  otherwise a centred panel at the owner's level (at least normal), so a
+  dialog that an accessory button opens comes up above it; the app asks to
+  be activated. While such a button's handler runs the panel ignores the
+  mouse ("busy" update).
+- Save panels refuse names that Windows programs cannot create (\ / * ? "
+  < > |, control characters, trailing dot or space). Filter extensions with
+  wildcards or separators are not used as allowed types.
+- Open panels test file names against the filters with their own matcher,
+  not libc fnmatch (one fnmatch call once kept the main thread, and so the
+  panel, busy for minutes): "*.ext" compares the suffix in any case; other
+  patterns use '*' and '?' only, ASCII case folding, no locale, '[' and ']'
+  literal. The answer is cached per (filter, file name) until the filter
+  changes, and a shouldEnableURL call that takes more than 50 ms is logged
+  (ERR) with the patterns and the name.
+- The panel reports "started" once it is up. An exception while it is set
+  up ends it without that line (comdlg32 then shows the Wine dialog);
+  exceptions while applying updates are logged and dropped.
+- The panel is asynchronous. Folder, selection, type and control changes and
+  the final result are queued as text lines; updates from comdlg32 change
+  controls, file name, Format and folder while it is up. The unix call
+  (unix_file_dialog: begin, poll, update, cancel, release) never waits for
+  the user, so the Windows thread keeps pumping messages.
+- The PE side exports macsw_file_dialog() (winemac.drv.spec), which
+  comdlg32 finds with GetProcAddress. The parameter block has the same
+  layout for 32- and 64-bit callers, so the wow64 table uses the same entry.
+- MACSW_NATIVE_FILE_DIALOG_TEST (automation only, passed in the request by
+  comdlg32) ends the real panel after an optional delay with a given answer,
+  after setting the Format popup and accessory controls as a user would; a
+  save name the panel refuses ends it with cancel. Before an answer with
+  paths it sends a folder line for the first path's folder and, in open
+  panels, a selection line with the paths, then answers 500 ms later, as a
+  user who goes to the file and clicks it.
+
+Nothing here runs unless comdlg32 asks for a panel.
+
+diff --git a/dlls/winemac.drv/Makefile.in b/dlls/winemac.drv/Makefile.in
+index 576a2fb..9d98e46 100644
+--- a/dlls/winemac.drv/Makefile.in
++++ b/dlls/winemac.drv/Makefile.in
+@@ -23,6 +23,7 @@ SOURCES = \
+ 	cocoa_cursorclipping.m \
+ 	cocoa_display.m \
+ 	cocoa_event.m \
++	cocoa_filedialog.m \
+ 	cocoa_main.m \
+ 	cocoa_opengl.m \
+ 	cocoa_status_item.m \
+@@ -40,4 +41,5 @@ SOURCES = \
+ 	systray.c \
+ 	vulkan.c \
+ 	window.c \
++	winemac.drv.spec \
+ 	winemac.rc
+diff --git a/dlls/winemac.drv/cocoa_filedialog.m b/dlls/winemac.drv/cocoa_filedialog.m
+new file mode 100644
+index 0000000..b7f449a
+--- /dev/null
++++ b/dlls/winemac.drv/cocoa_filedialog.m
+@@ -0,0 +1,1192 @@
++/*
++ * MACDRV Cocoa file dialogs (NSOpenPanel / NSSavePanel for comdlg32)
++ *
++ * Copyright 2026 MacSW contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++/*
++ * comdlg32 describes the dialog as a JSON object (macdrv_file_dialog_begin).
++ * The panel runs asynchronously on the main thread; the Windows thread keeps
++ * pumping its messages and collects what happened with macdrv_file_dialog_poll
++ * as lines of tab separated fields ("started" once the panel is up, then
++ * "folder", "selection", "type", "check", "item", "button", "edit", then
++ * "path"... and a final "result" line). Field values escape backslash, tab,
++ * CR and LF with a backslash. A panel that ends without "started" did not
++ * come up, and comdlg32 shows the Wine dialog instead.
++ */
++
++#import <Cocoa/Cocoa.h>
++#include <string.h>
++#include "macdrv_cocoa.h"
++#import "cocoa_app.h"
++#import "cocoa_window.h"
++
++#pragma GCC diagnostic ignored "-Wdeclaration-after-statement"
++#pragma clang diagnostic ignored "-Wdeprecated-declarations"
++
++
++static NSString* str_value(id value)
++{
++    return [value isKindOfClass:[NSString class]] ? value : nil;
++}
++
++static NSInteger int_value(id value, NSInteger def)
++{
++    return [value isKindOfClass:[NSNumber class]] ? [value integerValue] : def;
++}
++
++static BOOL bool_value(id value, BOOL def)
++{
++    return [value isKindOfClass:[NSNumber class]] ? [value boolValue] : def;
++}
++
++static NSArray* array_value(id value)
++{
++    return [value isKindOfClass:[NSArray class]] ? value : nil;
++}
++
++/* Windows labels carry '&' mnemonics: "&Open" -> "Open", "&&" -> "&". */
++static NSString* strip_mnemonic(NSString* label)
++{
++    NSMutableString* ret;
++    NSUInteger i;
++
++    if (!label) return @"";
++    ret = [NSMutableString stringWithCapacity:[label length]];
++    for (i = 0; i < [label length]; i++)
++    {
++        unichar c = [label characterAtIndex:i];
++        if (c == '&')
++        {
++            if (i + 1 < [label length] && [label characterAtIndex:i + 1] == '&')
++            {
++                [ret appendString:@"&"];
++                i++;
++            }
++            continue;
++        }
++        [ret appendFormat:@"%C", c];
++    }
++    return ret;
++}
++
++static NSString* escape_field(NSString* s)
++{
++    NSMutableString* ret = [[s mutableCopy] autorelease];
++    [ret replaceOccurrencesOfString:@"\\" withString:@"\\\\" options:0 range:NSMakeRange(0, [ret length])];
++    [ret replaceOccurrencesOfString:@"\t" withString:@"\\t" options:0 range:NSMakeRange(0, [ret length])];
++    [ret replaceOccurrencesOfString:@"\n" withString:@"\\n" options:0 range:NSMakeRange(0, [ret length])];
++    [ret replaceOccurrencesOfString:@"\r" withString:@"\\r" options:0 range:NSMakeRange(0, [ret length])];
++    return ret;
++}
++
++/* MACSW_FILTER_MATCH_BEGIN (scripts/tests/test_wine_native_file_dialogs.py compiles this part natively)
++ *
++ * Windows filter patterns against a file name, without libc fnmatch: fnmatch
++ * depends on the locale and backtracks, and one call once kept the main thread
++ * (and so the open panel) busy for minutes. ASCII case folding, no locale;
++ * only '*' and '?' are wildcards, '[' and ']' are literal (as on Windows).
++ */
++static int filter_lower(int c)
++{
++    return (c >= 'A' && c <= 'Z') ? c - 'A' + 'a' : c;
++}
++
++/* '*' and '?' with two indices and one backtrack point: O(n * m) at worst. */
++static int filter_wildcard_match(const char* pattern, const char* name)
++{
++    size_t p = 0, n = 0, star = (size_t)-1, mark = 0;
++
++    while (name[n])
++    {
++        if (pattern[p] == '*')
++        {
++            star = p++;
++            mark = n;
++        }
++        else if (pattern[p] && (pattern[p] == '?' ||
++                 filter_lower((unsigned char)pattern[p]) == filter_lower((unsigned char)name[n])))
++        {
++            p++;
++            n++;
++        }
++        else if (star != (size_t)-1)
++        {
++            p = star + 1;
++            n = ++mark;
++        }
++        else
++            return 0;
++    }
++    while (pattern[p] == '*') p++;
++    return !pattern[p];
++}
++
++/* "*.ext" without other wildcards: the name ends in ".ext", in any case. */
++static int filter_match(const char* pattern, const char* name)
++{
++    size_t plen = strlen(pattern), nlen = strlen(name), i;
++
++    if (plen >= 2 && pattern[0] == '*' && pattern[1] == '.' && !strpbrk(pattern + 1, "*?"))
++    {
++        if (nlen < plen - 1) return 0;
++        for (i = 1; i < plen; i++)
++            if (filter_lower((unsigned char)pattern[i]) != filter_lower((unsigned char)name[nlen - plen + i]))
++                return 0;
++        return 1;
++    }
++    return filter_wildcard_match(pattern, name);
++}
++/* MACSW_FILTER_MATCH_END */
++
++/* Windows filter patterns ("*.sldprt", "*.*") against a file name. */
++static BOOL name_matches(NSString* name, NSArray* patterns)
++{
++    const char* cname = [name UTF8String];
++
++    if (![patterns count]) return YES;
++    if (!cname) return NO;
++    for (NSString* pattern in patterns)
++    {
++        const char* cpattern;
++
++        if ([pattern isEqualToString:@"*"] || [pattern isEqualToString:@"*.*"]) return YES;
++        cpattern = [pattern UTF8String];
++        if (cpattern && filter_match(cpattern, cname)) return YES;
++    }
++    return NO;
++}
++
++/* "*.sldprt" -> "sldprt"; patterns with wildcards or separators in the extension give nothing. */
++static NSArray* concrete_extensions(NSArray* patterns)
++{
++    NSMutableArray* ret = [NSMutableArray array];
++    for (NSString* pattern in patterns)
++    {
++        NSString* ext;
++        if (![pattern hasPrefix:@"*."]) continue;
++        ext = [pattern substringFromIndex:2];
++        if (![ext length] || [ext rangeOfCharacterFromSet:[NSCharacterSet characterSetWithCharactersInString:@"*?./\\:"]].location != NSNotFound)
++            continue;
++        [ret addObject:ext];
++    }
++    return ret;
++}
++
++/* Names Windows programs cannot create: \ / * ? " < > |, control characters,
++   a trailing dot or space (comdlg32 maps existing ones to Wine's 8.3 name). */
++static BOOL is_windows_name(NSString* name)
++{
++    NSMutableCharacterSet* invalid = [NSMutableCharacterSet characterSetWithCharactersInString:@"\\/*?\"<>|"];
++
++    [invalid formUnionWithCharacterSet:[NSCharacterSet controlCharacterSet]];
++    return [name length] && [name rangeOfCharacterFromSet:invalid].location == NSNotFound &&
++           ![name hasSuffix:@"."] && ![name hasSuffix:@" "];
++}
++
++
++@interface WineFileDialog : NSObject <NSOpenSavePanelDelegate>
++{
++    NSDictionary* request;
++    WineWindow* owner;
++    NSSavePanel* panel;
++    NSString* mode;
++    NSArray* filterNames;
++    NSArray* filterPatterns;
++    NSInteger filterIndex;
++    NSString* defaultExt;
++    BOOL appendExtension;
++    NSPopUpButton* formatPopup;
++    NSMutableDictionary* controlViews;
++    NSString* controlLayout;
++    NSMutableString* pending;
++    BOOL started, finished, testDone;
++    NSArray* testURLs;
++    NSMutableDictionary* matchCache;
++}
++
++- (id) initWithRequest:(NSDictionary*)inRequest owner:(WineWindow*)inOwner;
++- (void) show;
++- (void) cancelPanel;
++- (void) applyUpdate:(NSDictionary*)update;
++- (int) takePending:(char*)buffer size:(unsigned int)size length:(unsigned int*)len;
++
++@end
++
++
++@implementation WineFileDialog
++
++    - (id) initWithRequest:(NSDictionary*)inRequest owner:(WineWindow*)inOwner
++    {
++        self = [super init];
++        if (self)
++        {
++            NSMutableArray* names = [NSMutableArray array];
++            NSMutableArray* patterns = [NSMutableArray array];
++
++            request = [inRequest retain];
++            owner = [inOwner retain];
++            mode = [(str_value(request[@"mode"]) ?: @"open") copy];
++            for (id filter in array_value(request[@"filters"]))
++            {
++                if (![filter isKindOfClass:[NSDictionary class]]) continue;
++                [names addObject:str_value(filter[@"name"]) ?: @""];
++                [patterns addObject:array_value(filter[@"patterns"]) ?: @[]];
++            }
++            filterNames = [names copy];
++            filterPatterns = [patterns copy];
++            filterIndex = int_value(request[@"filterIndex"], 0);
++            if (filterIndex < 0 || filterIndex >= (NSInteger)[filterNames count]) filterIndex = 0;
++            defaultExt = [str_value(request[@"defaultExt"]) copy];
++            appendExtension = bool_value(request[@"appendExtension"], NO);
++            controlViews = [[NSMutableDictionary alloc] init];
++            pending = [[NSMutableString alloc] init];
++            matchCache = [[NSMutableDictionary alloc] init];
++        }
++        return self;
++    }
++
++    - (void) dealloc
++    {
++        [panel setDelegate:nil];
++        [panel release];
++        [request release];
++        [owner release];
++        [mode release];
++        [filterNames release];
++        [filterPatterns release];
++        [defaultExt release];
++        [formatPopup release];
++        [controlViews release];
++        [controlLayout release];
++        [pending release];
++        [testURLs release];
++        [matchCache release];
++        [super dealloc];
++    }
++
++    - (BOOL) isSave
++    {
++        return [mode isEqualToString:@"save"];
++    }
++
++    - (BOOL) isFolder
++    {
++        return [mode isEqualToString:@"folder"];
++    }
++
++    - (void) queueLine:(NSString*)line
++    {
++        @synchronized(self)
++        {
++            if (finished) return;
++            [pending appendString:line];
++            [pending appendString:@"\n"];
++        }
++    }
++
++    - (int) takePending:(char*)buffer size:(unsigned int)size length:(unsigned int*)len
++    {
++        @synchronized(self)
++        {
++            NSData* data = [pending dataUsingEncoding:NSUTF8StringEncoding];
++            if ([data length] > size)
++            {
++                *len = [data length];
++                return 2;
++            }
++            memcpy(buffer, [data bytes], [data length]);
++            *len = [data length];
++            [pending setString:@""];
++            return finished ? 1 : 0;
++        }
++    }
++
++    - (NSArray*) currentPatterns
++    {
++        if (filterIndex < 0 || filterIndex >= (NSInteger)[filterPatterns count]) return @[];
++        return filterPatterns[filterIndex];
++    }
++
++
++    /*
++     * Accessory view: the "Format" popup for the Windows filters, followed by
++     * the IFileDialogCustomize controls (or OPENFILENAME's read-only box).
++     */
++    - (NSView*) rowWithViews:(NSArray*)views
++    {
++        NSStackView* row = [NSStackView stackViewWithViews:views];
++        [row setOrientation:NSUserInterfaceLayoutOrientationHorizontal];
++        [row setAlignment:NSLayoutAttributeFirstBaseline];
++        [row setSpacing:8];
++        return row;
++    }
++
++    - (NSPopUpButton*) popupWithItems:(NSArray*)items pullsDown:(BOOL)pullsDown title:(NSString*)title
++    {
++        NSPopUpButton* popup = [[[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:pullsDown] autorelease];
++        NSMenu* menu = [popup menu];
++
++        [popup setAutoenablesItems:NO];
++        if (pullsDown)
++            [menu addItemWithTitle:strip_mnemonic(title) action:NULL keyEquivalent:@""];
++        for (id item in items)
++        {
++            NSMenuItem* menuItem;
++            if (![item isKindOfClass:[NSDictionary class]]) continue;
++            menuItem = [menu addItemWithTitle:strip_mnemonic(str_value(item[@"label"])) action:NULL keyEquivalent:@""];
++            [menuItem setTag:int_value(item[@"id"], 0)];
++            [menuItem setEnabled:bool_value(item[@"enabled"], YES)];
++            [menuItem setHidden:!bool_value(item[@"visible"], YES)];
++        }
++        return popup;
++    }
++
++    - (NSView*) viewForControl:(NSDictionary*)desc
++    {
++        NSString* type = str_value(desc[@"type"]);
++        NSInteger ident = int_value(desc[@"id"], 0);
++        NSString* identString = [NSString stringWithFormat:@"%ld", (long)ident];
++        NSView* view = nil;
++
++        if ([type isEqualToString:@"check"])
++        {
++            NSButton* button = [NSButton checkboxWithTitle:strip_mnemonic(str_value(desc[@"label"]))
++                                                    target:self action:@selector(checkChanged:)];
++            [button setTag:ident];
++            [button setState:bool_value(desc[@"checked"], NO) ? NSControlStateValueOn : NSControlStateValueOff];
++            view = button;
++        }
++        else if ([type isEqualToString:@"combo"] || [type isEqualToString:@"menu"])
++        {
++            BOOL menu = [type isEqualToString:@"menu"];
++            NSPopUpButton* popup = [self popupWithItems:array_value(desc[@"items"]) pullsDown:menu
++                                                  title:str_value(desc[@"label"])];
++            [popup setTag:ident];
++            [popup setTarget:self];
++            [popup setAction:menu ? @selector(menuChosen:) : @selector(itemChanged:)];
++            if (!menu && desc[@"selected"])
++                [popup selectItemWithTag:int_value(desc[@"selected"], 0)];
++            view = popup;
++        }
++        else if ([type isEqualToString:@"radio"])
++        {
++            NSMutableArray* buttons = [NSMutableArray array];
++            NSInteger selected = int_value(desc[@"selected"], -1);
++            NSStackView* stack;
++
++            for (id item in array_value(desc[@"items"]))
++            {
++                NSButton* button;
++                if (![item isKindOfClass:[NSDictionary class]]) continue;
++                button = [NSButton radioButtonWithTitle:strip_mnemonic(str_value(item[@"label"]))
++                                                 target:self action:@selector(radioChanged:)];
++                [button setTag:int_value(item[@"id"], 0)];
++                [button setIdentifier:identString];
++                [button setEnabled:bool_value(item[@"enabled"], YES)];
++                [button setHidden:!bool_value(item[@"visible"], YES)];
++                [button setState:[button tag] == selected ? NSControlStateValueOn : NSControlStateValueOff];
++                [buttons addObject:button];
++            }
++            stack = [NSStackView stackViewWithViews:buttons];
++            [stack setOrientation:NSUserInterfaceLayoutOrientationVertical];
++            [stack setAlignment:NSLayoutAttributeLeading];
++            [stack setSpacing:4];
++            view = stack;
++        }
++        else if ([type isEqualToString:@"text"])
++            view = [NSTextField labelWithString:strip_mnemonic(str_value(desc[@"label"]))];
++        else if ([type isEqualToString:@"edit"])
++        {
++            NSTextField* field = [NSTextField textFieldWithString:str_value(desc[@"text"]) ?: @""];
++            [[field cell] setSendsActionOnEndEditing:YES];
++            [field setTag:ident];
++            [field setTarget:self];
++            [field setAction:@selector(editChanged:)];
++            [[field widthAnchor] constraintGreaterThanOrEqualToConstant:200].active = YES;
++            view = field;
++        }
++        else if ([type isEqualToString:@"separator"])
++        {
++            NSBox* box = [[[NSBox alloc] initWithFrame:NSMakeRect(0, 0, 300, 1)] autorelease];
++            [box setBoxType:NSBoxSeparator];
++            [[box widthAnchor] constraintEqualToConstant:300].active = YES;
++            view = box;
++        }
++        else if ([type isEqualToString:@"button"])
++        {
++            NSButton* button = [NSButton buttonWithTitle:strip_mnemonic(str_value(desc[@"label"]))
++                                                  target:self action:@selector(buttonClicked:)];
++            [button setTag:ident];
++            view = button;
++        }
++        else if ([type isEqualToString:@"group"])
++        {
++            NSMutableArray* views = [NSMutableArray array];
++            NSString* label = strip_mnemonic(str_value(desc[@"label"]));
++
++            if ([label length])
++                [views addObject:[NSTextField labelWithString:label]];
++            for (id child in array_value(desc[@"children"]))
++            {
++                NSView* childView;
++                if ([child isKindOfClass:[NSDictionary class]] && (childView = [self viewForControl:child]))
++                    [views addObject:childView];
++            }
++            view = [self rowWithViews:views];
++        }
++
++        if (!view) return nil;
++        [view setHidden:!bool_value(desc[@"visible"], YES)];
++        if ([view isKindOfClass:[NSControl class]])
++            [(NSControl*)view setEnabled:bool_value(desc[@"enabled"], YES)];
++        else if ([type isEqualToString:@"radio"] && !bool_value(desc[@"enabled"], YES))
++        {
++            for (NSView* button in [(NSStackView*)view views])
++                [(NSButton*)button setEnabled:NO];
++        }
++        controlViews[@(ident)] = view;
++        return view;
++    }
++
++    - (NSView*) buildAccessory:(NSArray*)controls
++    {
++        NSMutableArray* rows = [NSMutableArray array];
++        NSStackView* stack;
++        NSSize size;
++
++        [controlViews removeAllObjects];
++        [formatPopup release];
++        formatPopup = nil;
++
++        if ([filterNames count] > 1)
++        {
++            NSMutableArray* items = [NSMutableArray array];
++            NSUInteger i;
++
++            for (i = 0; i < [filterNames count]; i++)
++                [items addObject:@{ @"label": filterNames[i], @"id": @(i) }];
++            formatPopup = [[self popupWithItems:items pullsDown:NO title:nil] retain];
++            [formatPopup selectItemAtIndex:filterIndex];
++            [formatPopup setTarget:self];
++            [formatPopup setAction:@selector(formatChanged:)];
++            [rows addObject:[self rowWithViews:@[[NSTextField labelWithString:@"Format:"], formatPopup]]];
++        }
++
++        for (id control in controls)
++        {
++            NSView* view;
++            if ([control isKindOfClass:[NSDictionary class]] && (view = [self viewForControl:control]))
++                [rows addObject:view];
++        }
++
++        if (![rows count]) return nil;
++
++        stack = [NSStackView stackViewWithViews:rows];
++        [stack setOrientation:NSUserInterfaceLayoutOrientationVertical];
++        [stack setAlignment:NSLayoutAttributeCenterX];
++        [stack setSpacing:8];
++        [stack setEdgeInsets:NSEdgeInsetsMake(12, 20, 12, 20)];
++        size = [stack fittingSize];
++        [stack setFrame:NSMakeRect(0, 0, MAX(size.width, 360), size.height)];
++        return stack;
++    }
++
++    /* Rebuild when controls or items come, go, show or hide (the accessory
++       view must change size); other changes are made in place. */
++    - (NSString*) layoutOfControls:(NSArray*)controls
++    {
++        NSMutableString* layout = [NSMutableString string];
++        for (id control in controls)
++        {
++            if (![control isKindOfClass:[NSDictionary class]]) continue;
++            [layout appendFormat:@"%@:%@:%@:%d(", control[@"id"], control[@"type"], control[@"label"],
++                                 bool_value(control[@"visible"], YES)];
++            for (id item in array_value(control[@"items"]))
++                if ([item isKindOfClass:[NSDictionary class]])
++                    [layout appendFormat:@"%@=%@:%d,", item[@"id"], item[@"label"], bool_value(item[@"visible"], YES)];
++            [layout appendString:[self layoutOfControls:array_value(control[@"children"])]];
++            [layout appendString:@");"];
++        }
++        return layout;
++    }
++
++    - (void) updateControl:(NSDictionary*)desc
++    {
++        NSString* type = str_value(desc[@"type"]);
++        NSView* view = controlViews[@(int_value(desc[@"id"], 0))];
++        BOOL enabled = bool_value(desc[@"enabled"], YES);
++
++        for (id child in array_value(desc[@"children"]))
++            if ([child isKindOfClass:[NSDictionary class]]) [self updateControl:child];
++        if (!view) return;
++
++        [view setHidden:!bool_value(desc[@"visible"], YES)];
++        if ([view isKindOfClass:[NSControl class]])
++            [(NSControl*)view setEnabled:enabled];
++
++        if ([type isEqualToString:@"check"])
++            [(NSButton*)view setState:bool_value(desc[@"checked"], NO) ? NSControlStateValueOn : NSControlStateValueOff];
++        else if ([type isEqualToString:@"combo"] || [type isEqualToString:@"menu"])
++        {
++            NSPopUpButton* popup = (NSPopUpButton*)view;
++            for (id item in array_value(desc[@"items"]))
++            {
++                NSMenuItem* menuItem;
++                if (![item isKindOfClass:[NSDictionary class]]) continue;
++                menuItem = [[popup menu] itemWithTag:int_value(item[@"id"], 0)];
++                [menuItem setEnabled:bool_value(item[@"enabled"], YES)];
++                [menuItem setHidden:!bool_value(item[@"visible"], YES)];
++            }
++            if ([type isEqualToString:@"combo"] && desc[@"selected"])
++                [popup selectItemWithTag:int_value(desc[@"selected"], 0)];
++        }
++        else if ([type isEqualToString:@"radio"])
++        {
++            NSInteger selected = int_value(desc[@"selected"], -1);
++            for (NSButton* button in [(NSStackView*)view views])
++            {
++                for (id item in array_value(desc[@"items"]))
++                {
++                    if (![item isKindOfClass:[NSDictionary class]] || int_value(item[@"id"], -1) != [button tag])
++                        continue;
++                    [button setEnabled:enabled && bool_value(item[@"enabled"], YES)];
++                    [button setHidden:!bool_value(item[@"visible"], YES)];
++                }
++                [button setState:[button tag] == selected ? NSControlStateValueOn : NSControlStateValueOff];
++            }
++        }
++        else if ([type isEqualToString:@"text"] || [type isEqualToString:@"button"])
++        {
++            NSString* label = strip_mnemonic(str_value(desc[@"label"]));
++            if ([view isKindOfClass:[NSButton class]]) [(NSButton*)view setTitle:label];
++            else [(NSTextField*)view setStringValue:label];
++        }
++        else if ([type isEqualToString:@"edit"])
++        {
++            NSTextField* field = (NSTextField*)view;
++            if (![field currentEditor]) [field setStringValue:str_value(desc[@"text"]) ?: @""];
++        }
++    }
++
++    - (void) setControls:(NSArray*)controls
++    {
++        NSString* layout = [self layoutOfControls:controls];
++
++        if (controlLayout && [layout isEqualToString:controlLayout])
++        {
++            for (id control in controls)
++                if ([control isKindOfClass:[NSDictionary class]]) [self updateControl:control];
++            return;
++        }
++
++        [controlLayout release];
++        controlLayout = [layout copy];
++        [panel setAccessoryView:[self buildAccessory:controls]];
++        if ([panel isKindOfClass:[NSOpenPanel class]] && [panel accessoryView])
++            [(NSOpenPanel*)panel setAccessoryViewDisclosed:YES];
++    }
++
++
++    /*
++     * Filters.  Open panels grey out non-matching files through the delegate.
++     * Save panels also get allowedFileTypes so that NSSavePanel appends the
++     * extension before its own overwrite check, which is the only overwrite
++     * prompt the user sees.
++     */
++    - (void) applyFilterFrom:(NSInteger)previous
++    {
++        @synchronized(self) { [matchCache removeAllObjects]; }
++        if ([self isSave])
++        {
++            NSArray* exts = appendExtension ? concrete_extensions([self currentPatterns]) : @[];
++
++            if (![exts count] && appendExtension && [defaultExt length]) exts = @[defaultExt];
++            if (previous >= 0 && previous != filterIndex && [exts count])
++            {
++                NSString* name = [panel nameFieldStringValue];
++                NSArray* old = filterPatterns[previous];
++
++                if ([name length])
++                {
++                    if ([[name pathExtension] length] && name_matches(name, old))
++                        name = [name stringByDeletingPathExtension];
++                    if (![[[name pathExtension] lowercaseString] isEqualToString:[exts[0] lowercaseString]])
++                        name = [name stringByAppendingPathExtension:exts[0]];
++                    if (name) [panel setNameFieldStringValue:name];
++                }
++            }
++            [panel setAllowedFileTypes:[exts count] ? exts : nil];
++        }
++        [panel validateVisibleColumns];
++    }
++
++    - (void) formatChanged:(id)sender
++    {
++        NSInteger previous = filterIndex;
++        NSInteger index = [formatPopup indexOfSelectedItem];
++
++        if (index < 0 || index == previous) return;
++        filterIndex = index;
++        [self applyFilterFrom:previous];
++        [self queueLine:[NSString stringWithFormat:@"type\t%ld", (long)filterIndex]];
++    }
++
++    /* The panel asks again for every listed file whenever it redraws; the answer
++       depends only on the name and the filter, so it is cached per (filter, name)
++       until the filter changes. A slow answer is logged with its input. */
++    - (BOOL) panel:(id)sender shouldEnableURL:(NSURL*)url
++    {
++        NSNumber* directory = nil;
++        NSString* name;
++        NSString* key;
++        NSNumber* cached;
++        NSArray* patterns;
++        CFAbsoluteTime start;
++        double ms;
++        BOOL ret;
++
++        start = CFAbsoluteTimeGetCurrent();
++        [url getResourceValue:&directory forKey:NSURLIsDirectoryKey error:NULL];
++        if ([directory boolValue]) return YES;
++        if ([self isFolder]) return NO;
++
++        name = [url lastPathComponent];
++        patterns = [self currentPatterns];
++        key = [NSString stringWithFormat:@"%ld/%@", (long)filterIndex, name];
++        @synchronized(self) { cached = [[[matchCache objectForKey:key] retain] autorelease]; }
++        if (cached) return [cached boolValue];
++        ret = name_matches(name, patterns);
++        @synchronized(self) { [matchCache setObject:[NSNumber numberWithBool:ret] forKey:key]; }
++        ms = (CFAbsoluteTimeGetCurrent() - start) * 1000.0;
++        if (ms > 50.0)
++            ERR(@"shouldEnableURL took %.0f ms: patterns \"%@\" name \"%@\"\n", ms,
++                [patterns componentsJoinedByString:@";"], name);
++        return ret;
++    }
++
++    /* A save panel refuses a name that Windows programs cannot create. */
++    - (BOOL) panel:(id)sender validateURL:(NSURL*)url error:(NSError**)outError
++    {
++        if (![self isSave] || is_windows_name([url lastPathComponent])) return YES;
++        if (outError)
++        {
++            *outError = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFileWriteInvalidFileNameError
++                                        userInfo:@{ NSLocalizedDescriptionKey:
++                                                    @"Windows programs cannot use this name.",
++                                                    NSLocalizedRecoverySuggestionErrorKey:
++                                                    @"Do not use \\ / * ? \" < > | or a dot or space at the end." }];
++        }
++        return NO;
++    }
++
++    - (void) panel:(id)sender didChangeToDirectoryURL:(NSURL*)url
++    {
++        if ([url path])
++            [self queueLine:[NSString stringWithFormat:@"folder\t%@", escape_field([url path])]];
++    }
++
++    - (NSArray*) selectedURLs
++    {
++        if ([panel isKindOfClass:[NSOpenPanel class]]) return [(NSOpenPanel*)panel URLs];
++        return [panel URL] ? @[[panel URL]] : @[];
++    }
++
++    - (void) panelSelectionDidChange:(id)sender
++    {
++        NSMutableString* line = [NSMutableString stringWithString:@"selection"];
++        for (NSURL* url in [self selectedURLs])
++            if ([url path]) [line appendFormat:@"\t%@", escape_field([url path])];
++        [self queueLine:line];
++    }
++
++
++    /* Accessory control actions become IFileDialogControlEvents on the Windows thread. */
++    - (void) checkChanged:(NSButton*)sender
++    {
++        [self queueLine:[NSString stringWithFormat:@"check\t%ld\t%d", (long)[sender tag],
++                         [sender state] == NSControlStateValueOn]];
++    }
++
++    - (void) itemChanged:(NSPopUpButton*)sender
++    {
++        [self queueLine:[NSString stringWithFormat:@"item\t%ld\t%ld", (long)[sender tag],
++                         (long)[[sender selectedItem] tag]]];
++    }
++
++    - (void) menuChosen:(NSPopUpButton*)sender
++    {
++        [self queueLine:[NSString stringWithFormat:@"item\t%ld\t%ld", (long)[sender tag],
++                         (long)[[sender selectedItem] tag]]];
++    }
++
++    - (void) radioChanged:(NSButton*)sender
++    {
++        [self queueLine:[NSString stringWithFormat:@"item\t%@\t%ld", [sender identifier], (long)[sender tag]]];
++    }
++
++    - (void) buttonClicked:(NSButton*)sender
++    {
++        [self queueLine:[NSString stringWithFormat:@"button\t%ld", (long)[sender tag]]];
++    }
++
++    - (void) editChanged:(NSTextField*)sender
++    {
++        [self queueLine:[NSString stringWithFormat:@"edit\t%ld\t%@", (long)[sender tag],
++                         escape_field([sender stringValue])]];
++    }
++
++
++    - (void) completeWithResponse:(NSModalResponse)response
++    {
++        NSMutableString* lines = [NSMutableString string];
++        NSArray* urls;
++        BOOL ok;
++
++        if (finished) return;
++        if (testDone)
++        {
++            urls = testURLs;
++            ok = [urls count] > 0;
++        }
++        else
++        {
++            ok = (response == NSModalResponseOK);
++            urls = ok ? [self selectedURLs] : nil;
++            ok = ok && [urls count] > 0;
++        }
++
++        for (NSNumber* ident in controlViews)
++        {
++            NSTextField* field = controlViews[ident];
++            if ([field isKindOfClass:[NSTextField class]] && [field isEditable])
++                [lines appendFormat:@"edit\t%@\t%@\n", ident, escape_field([field stringValue])];
++        }
++        [lines appendFormat:@"type\t%ld\n", (long)filterIndex];
++        if (ok)
++        {
++            for (NSURL* url in urls)
++                if ([url path]) [lines appendFormat:@"path\t%@\n", escape_field([url path])];
++        }
++        [lines appendFormat:@"result\t%@\n", ok ? @"ok" : @"cancel"];
++
++        @synchronized(self)
++        {
++            [pending appendString:lines];
++            finished = YES;
++        }
++        [panel setDelegate:nil];
++    }
++
++    - (void) cancelPanel
++    {
++        if (finished) return;
++        if (!started)
++        {
++            [self completeWithResponse:NSModalResponseCancel];
++            return;
++        }
++        [panel cancel:nil];
++        /* Should the panel not call its completion handler, do not leave
++           the Windows thread waiting forever. */
++        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), ^{
++            if (!finished)
++            {
++                [panel orderOut:nil];
++                [self completeWithResponse:NSModalResponseCancel];
++            }
++        });
++    }
++
++    /* MACSW_NATIVE_FILE_DIALOG_TEST: act like a user, then end the real panel. */
++    - (void) runTest
++    {
++        NSDictionary* test = request[@"test"];
++        NSString* response = str_value(test[@"response"]);
++        NSString* controls = str_value(test[@"controls"]);
++        NSInteger type = int_value(test[@"type"], 0);
++
++        if (finished) return;
++        if (type > 0 && formatPopup && type <= [formatPopup numberOfItems])
++        {
++            [formatPopup selectItemAtIndex:type - 1];
++            [self formatChanged:formatPopup];
++        }
++        for (NSString* assignment in [controls componentsSeparatedByString:@";"])
++        {
++            NSArray* parts = [assignment componentsSeparatedByString:@"="];
++            NSView* view;
++            NSString* value;
++
++            if ([parts count] != 2) continue;
++            view = controlViews[@([parts[0] integerValue])];
++            value = parts[1];
++            if ([view isKindOfClass:[NSPopUpButton class]])
++            {
++                NSPopUpButton* popup = (NSPopUpButton*)view;
++                [popup selectItemWithTag:[value integerValue]];
++                [popup sendAction:[popup action] to:[popup target]];
++            }
++            else if ([view isKindOfClass:[NSStackView class]])
++            {
++                for (NSButton* button in [(NSStackView*)view views])
++                {
++                    if ([button tag] != [value integerValue]) continue;
++                    [button setState:NSControlStateValueOn];
++                    [self radioChanged:button];
++                }
++            }
++            else if ([view isKindOfClass:[NSButton class]])
++            {
++                NSButton* button = (NSButton*)view;
++                if ([button action] == @selector(checkChanged:))
++                    [button setState:[value integerValue] ? NSControlStateValueOn : NSControlStateValueOff];
++                [button sendAction:[button action] to:[button target]];
++            }
++            else if ([view isKindOfClass:[NSTextField class]])
++            {
++                [(NSTextField*)view setStringValue:value];
++                [self editChanged:(NSTextField*)view];
++            }
++        }
++
++        if (response && ![response isEqualToString:@"cancel"])
++        {
++            NSMutableArray* urls = [NSMutableArray array];
++            for (NSString* path in [response componentsSeparatedByString:@"\n"])
++                if ([path length]) [urls addObject:[NSURL fileURLWithPath:path]];
++            BOOL refused = NO;
++
++            /* A user cannot get a name past the panel that it refuses. */
++            for (NSURL* url in urls)
++                if (![self panel:panel validateURL:url error:NULL]) refused = YES;
++            testURLs = refused ? nil : [urls copy];
++        }
++
++        /* As a user who goes to the file's folder and clicks the file: a
++           folder line and, in open panels, a selection line; the answer
++           follows half a second later, so the program's handlers for these
++           events run first. */
++        if ([testURLs count])
++        {
++            NSMutableString* line = [NSMutableString stringWithString:@"selection"];
++
++            [self panel:panel didChangeToDirectoryURL:[testURLs[0] URLByDeletingLastPathComponent]];
++            if (![self isSave])
++            {
++                for (NSURL* url in testURLs)
++                    if ([url path]) [line appendFormat:@"\t%@", escape_field([url path])];
++                [self queueLine:line];
++            }
++            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
++                testDone = YES;
++                [self cancelPanel];
++            });
++            return;
++        }
++        testDone = YES;
++        [self cancelPanel];
++    }
++
++    - (void) present
++    {
++        NSString* title = str_value(request[@"title"]);
++        NSString* prompt = str_value(request[@"okLabel"]);
++        NSString* nameLabel = str_value(request[@"nameLabel"]);
++        NSString* directory = str_value(request[@"directory"]);
++        NSString* fileName = str_value(request[@"fileName"]);
++        NSDictionary* test = [request[@"test"] isKindOfClass:[NSDictionary class]] ? request[@"test"] : nil;
++        WineApplicationController* controller = [WineApplicationController sharedController];
++        NSURL* directoryURL = nil;
++
++        if (finished) return;
++
++        if ([self isSave])
++            panel = [[NSSavePanel savePanel] retain];
++        else
++        {
++            NSOpenPanel* openPanel = [NSOpenPanel openPanel];
++            [openPanel setCanChooseFiles:![self isFolder]];
++            [openPanel setCanChooseDirectories:[self isFolder]];
++            [openPanel setAllowsMultipleSelection:bool_value(request[@"multiple"], NO)];
++            [openPanel setResolvesAliases:YES];
++            panel = [openPanel retain];
++        }
++        [panel setDelegate:self];
++        [panel setCanCreateDirectories:YES];
++        [panel setShowsHiddenFiles:bool_value(request[@"showHidden"], NO)];
++        [panel setTreatsFilePackagesAsDirectories:YES];
++        if ([title length])
++        {
++            [panel setTitle:strip_mnemonic(title)];
++            [panel setMessage:strip_mnemonic(title)];
++        }
++        if ([prompt length]) [panel setPrompt:strip_mnemonic(prompt)];
++        if ([self isSave])
++        {
++            [panel setExtensionHidden:NO];
++            [panel setCanSelectHiddenExtension:NO];
++            [panel setAllowsOtherFileTypes:YES];
++            if ([nameLabel length]) [panel setNameFieldLabel:strip_mnemonic(nameLabel)];
++            if ([fileName length]) [panel setNameFieldStringValue:fileName];
++        }
++
++        if ([directory length])
++        {
++            directoryURL = [NSURL fileURLWithPath:directory isDirectory:YES];
++            /* An existing initial file name is preselected in an open panel. */
++            if (![self isSave] && [fileName length] &&
++                [[NSFileManager defaultManager] fileExistsAtPath:[directory stringByAppendingPathComponent:fileName]])
++                directoryURL = [NSURL fileURLWithPath:[directory stringByAppendingPathComponent:fileName]];
++            [panel setDirectoryURL:directoryURL];
++        }
++
++        [self setControls:array_value(request[@"controls"])];
++        [self applyFilterFrom:-1];
++
++        [controller transformProcessToForeground:NO];
++        [controller tryToActivateIgnoringOtherApps:YES];
++
++        started = YES;
++        if (owner && [owner isVisible] && ![owner isMiniaturized] && ![owner attachedSheet])
++        {
++            [panel beginSheetModalForWindow:owner completionHandler:^(NSModalResponse response){
++                [self completeWithResponse:response];
++            }];
++        }
++        else
++        {
++            /* The owner's level, not a modal-panel level: a dialog that an
++               accessory button opens (normal level) must come up above it. */
++            [panel setLevel:owner ? MAX([owner level], NSNormalWindowLevel) : NSNormalWindowLevel];
++            [panel center];
++            [panel beginWithCompletionHandler:^(NSModalResponse response){
++                [self completeWithResponse:response];
++            }];
++            [panel makeKeyAndOrderFront:nil];
++        }
++        [self queueLine:@"started"];
++
++        if (test)
++        {
++            NSInteger delay = MAX(int_value(test[@"delayMs"], 0), 0);
++            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delay * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
++                [self runTest];
++            });
++        }
++    }
++
++    - (void) show
++    {
++        @try
++        {
++            [self present];
++        }
++        @catch (id e)
++        {
++            ERR(@"Exception while showing the file panel: %@\n", e);
++            /* Without a "started" line comdlg32 shows the Wine dialog instead. */
++            @try
++            {
++                if ([panel sheetParent]) [[panel sheetParent] endSheet:panel];
++                else [panel orderOut:nil];
++            }
++            @catch (id e2) { }
++            [self completeWithResponse:NSModalResponseCancel];
++        }
++    }
++
++    /* Changes the application made: "controls", "fileName", "filterIndex",
++       "directory", and "busy" while an accessory button's handler runs. */
++    - (void) applyUpdate:(NSDictionary*)update
++    {
++        NSString* fileName = str_value(update[@"fileName"]);
++        NSString* directory = str_value(update[@"directory"]);
++        NSInteger index;
++
++        if (finished || !started) return;
++        @try
++        {
++            if (update[@"controls"]) [self setControls:array_value(update[@"controls"])];
++            if (fileName && [self isSave]) [panel setNameFieldStringValue:fileName];
++            index = int_value(update[@"filterIndex"], filterIndex);
++            if (index != filterIndex && index >= 0 && index < (NSInteger)[filterNames count])
++            {
++                NSInteger previous = filterIndex;
++                filterIndex = index;
++                [formatPopup selectItemAtIndex:index];
++                [self applyFilterFrom:previous];
++            }
++            if ([directory length])
++            {
++                /* SetFolder() while shown; the panel reports only the user's navigation. */
++                [panel setDirectoryURL:[NSURL fileURLWithPath:directory isDirectory:YES]];
++                [self panel:panel didChangeToDirectoryURL:[panel directoryURL]];
++            }
++            if (update[@"busy"]) [panel setIgnoresMouseEvents:bool_value(update[@"busy"], NO)];
++        }
++        @catch (id e)
++        {
++            ERR(@"Exception discarded while updating the file panel: %@\n", e);
++        }
++    }
++
++@end
++
++
++static NSMutableDictionary* file_dialogs;
++static int next_file_dialog_id = 1;
++
++static WineFileDialog* copy_file_dialog(int dialog)
++{
++    WineFileDialog* dlg;
++    @synchronized([WineFileDialog class])
++    {
++        dlg = [file_dialogs[@(dialog)] retain];
++    }
++    return dlg;
++}
++
++static NSDictionary* parse_json(const char* json, unsigned int len)
++{
++    id obj = [NSJSONSerialization JSONObjectWithData:[NSData dataWithBytes:json length:len] options:0 error:NULL];
++    return [obj isKindOfClass:[NSDictionary class]] ? obj : nil;
++}
++
++
++/***********************************************************************
++ *              macdrv_file_dialog_begin
++ *
++ * Start a panel described by a JSON request; returns a dialog id or 0.
++ * The owner, if any, is retained so it may get the panel as a sheet.
++ */
++int macdrv_file_dialog_begin(const char* json, unsigned int len, macdrv_window owner)
++{
++    @autoreleasepool
++    {
++        NSDictionary* request = parse_json(json, len);
++        WineFileDialog* dlg;
++        int dialog;
++
++        if (!request || !NSApp) return 0;
++        dlg = [[WineFileDialog alloc] initWithRequest:request owner:(WineWindow*)owner];
++        @synchronized([WineFileDialog class])
++        {
++            if (!file_dialogs) file_dialogs = [[NSMutableDictionary alloc] init];
++            dialog = next_file_dialog_id++;
++            file_dialogs[@(dialog)] = dlg;
++        }
++        OnMainThreadAsync(^{
++            [dlg show];
++        });
++        [dlg release];
++        return dialog;
++    }
++}
++
++
++/***********************************************************************
++ *              macdrv_file_dialog_poll
++ *
++ * Copy queued lines; returns 0 while the panel is up, 1 when it has ended,
++ * 2 if the buffer is too small (*len is the size needed), -1 for a bad id.
++ */
++int macdrv_file_dialog_poll(int dialog, char* buffer, unsigned int size, unsigned int* len)
++{
++    @autoreleasepool
++    {
++        WineFileDialog* dlg = copy_file_dialog(dialog);
++        int ret;
++
++        *len = 0;
++        if (!dlg) return -1;
++        ret = [dlg takePending:buffer size:size length:len];
++        [dlg release];
++        return ret;
++    }
++}
++
++
++/***********************************************************************
++ *              macdrv_file_dialog_update
++ *
++ * Apply a JSON update ("controls", "fileName") to a running panel.
++ */
++int macdrv_file_dialog_update(int dialog, const char* json, unsigned int len)
++{
++    @autoreleasepool
++    {
++        NSDictionary* update = parse_json(json, len);
++        WineFileDialog* dlg = copy_file_dialog(dialog);
++
++        if (!dlg || !update)
++        {
++            [dlg release];
++            return 0;
++        }
++        update = [update retain];
++        OnMainThreadAsync(^{
++            [dlg applyUpdate:update];
++            [update release];
++        });
++        [dlg release];
++        return 1;
++    }
++}
++
++
++/***********************************************************************
++ *              macdrv_file_dialog_cancel
++ */
++int macdrv_file_dialog_cancel(int dialog)
++{
++    @autoreleasepool
++    {
++        WineFileDialog* dlg = copy_file_dialog(dialog);
++
++        if (!dlg) return 0;
++        OnMainThreadAsync(^{
++            [dlg cancelPanel];
++        });
++        [dlg release];
++        return 1;
++    }
++}
++
++
++/***********************************************************************
++ *              macdrv_file_dialog_release
++ */
++int macdrv_file_dialog_release(int dialog)
++{
++    @autoreleasepool
++    {
++        WineFileDialog* dlg;
++
++        @synchronized([WineFileDialog class])
++        {
++            dlg = [file_dialogs[@(dialog)] retain];
++            [file_dialogs removeObjectForKey:@(dialog)];
++        }
++        if (!dlg) return 0;
++        OnMainThreadAsync(^{
++            [dlg cancelPanel];
++        });
++        [dlg release];
++        return 1;
++    }
++}
+diff --git a/dlls/winemac.drv/dllmain.c b/dlls/winemac.drv/dllmain.c
+index bbd528d..fb93929 100644
+--- a/dlls/winemac.drv/dllmain.c
++++ b/dlls/winemac.drv/dllmain.c
+@@ -405,6 +405,27 @@ static BOOL process_attach(void)
+     return TRUE;
+ }
+ 
++/***********************************************************************
++ *              macsw_file_dialog (WINEMAC.@)
++ *
++ * MacSW: lets comdlg32 show NSOpenPanel/NSSavePanel. The call never waits
++ * for the user; comdlg32 polls (MACDRV_FILE_DIALOG_POLL) while it pumps
++ * messages. Returns the dialog id (BEGIN), the poll state (POLL) or 1/0.
++ */
++INT WINAPI macsw_file_dialog(UINT op, UINT dialog, HWND owner, const char *in, UINT in_len,
++                             char *out, UINT out_size, UINT *out_len)
++{
++    struct file_dialog_params params =
++    {
++        .op = op, .dialog = dialog, .owner = HandleToUlong(owner),
++        .in_len = in_len, .in = (UINT_PTR)in, .out = (UINT_PTR)out, .out_size = out_size,
++    };
++
++    if (MACDRV_CALL(file_dialog, &params)) return -1;
++    if (out_len) *out_len = params.out_len;
++    return params.result;
++}
++
+ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, void *reserved)
+ {
+     if (reason != DLL_PROCESS_ATTACH) return TRUE;
+diff --git a/dlls/winemac.drv/macdrv_cocoa.h b/dlls/winemac.drv/macdrv_cocoa.h
+index 45301de..dfd817f 100644
+--- a/dlls/winemac.drv/macdrv_cocoa.h
++++ b/dlls/winemac.drv/macdrv_cocoa.h
+@@ -580,6 +580,13 @@ extern void macdrv_get_input_source_info(CFDataRef* uchr,CGEventSourceKeyboardTy
+ extern void macdrv_set_status_item_image(macdrv_status_item s, CGImageRef cgimage);
+ extern void macdrv_set_status_item_tooltip(macdrv_status_item s, CFStringRef cftip);
+ 
++/* MacSW native file dialogs */
++extern int macdrv_file_dialog_begin(const char *json, unsigned int len, macdrv_window owner);
++extern int macdrv_file_dialog_poll(int dialog, char *buffer, unsigned int size, unsigned int *len);
++extern int macdrv_file_dialog_update(int dialog, const char *json, unsigned int len);
++extern int macdrv_file_dialog_cancel(int dialog);
++extern int macdrv_file_dialog_release(int dialog);
++
+ /* ime */
+ extern pthread_mutex_t ime_composition_rect_mutex;
+ extern CGRect ime_composition_rect;
+diff --git a/dlls/winemac.drv/macdrv_main.c b/dlls/winemac.drv/macdrv_main.c
+index 9616824..780114d 100644
+--- a/dlls/winemac.drv/macdrv_main.c
++++ b/dlls/winemac.drv/macdrv_main.c
+@@ -605,10 +605,53 @@ static NTSTATUS macdrv_quit_result(void *arg)
+ }
+ 
+ 
++/***********************************************************************
++ *              macdrv_file_dialog
++ *
++ * MacSW: native NSOpenPanel/NSSavePanel for comdlg32 (cocoa_filedialog.m).
++ * Never blocks: the panel runs on the main thread and is polled.
++ */
++static NTSTATUS macdrv_file_dialog(void *arg)
++{
++    struct file_dialog_params *params = arg;
++
++    switch (params->op)
++    {
++    case MACDRV_FILE_DIALOG_BEGIN:
++    {
++        struct macdrv_win_data *data = get_win_data(UlongToHandle(params->owner));
++        macdrv_window owner = (data && data->on_screen) ? data->cocoa_window : NULL;
++
++        /* The window data lock keeps the Cocoa window alive until it is retained. */
++        params->result = macdrv_file_dialog_begin(param_ptr(params->in), params->in_len, owner);
++        release_win_data(data);
++        break;
++    }
++    case MACDRV_FILE_DIALOG_POLL:
++        params->result = macdrv_file_dialog_poll(params->dialog, param_ptr(params->out),
++                                                 params->out_size, &params->out_len);
++        break;
++    case MACDRV_FILE_DIALOG_UPDATE:
++        params->result = macdrv_file_dialog_update(params->dialog, param_ptr(params->in), params->in_len);
++        break;
++    case MACDRV_FILE_DIALOG_CANCEL:
++        params->result = macdrv_file_dialog_cancel(params->dialog);
++        break;
++    case MACDRV_FILE_DIALOG_RELEASE:
++        params->result = macdrv_file_dialog_release(params->dialog);
++        break;
++    default:
++        return STATUS_INVALID_PARAMETER;
++    }
++    return STATUS_SUCCESS;
++}
++
++
+ const unixlib_entry_t __wine_unix_call_funcs[] =
+ {
+     macdrv_init,
+     macdrv_quit_result,
++    macdrv_file_dialog,
+ };
+ 
+ C_ASSERT( ARRAYSIZE(__wine_unix_call_funcs) == unix_funcs_count );
+@@ -635,6 +678,7 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
+ {
+     wow64_init,
+     macdrv_quit_result,
++    macdrv_file_dialog,
+ };
+ 
+ C_ASSERT( ARRAYSIZE(__wine_unix_call_wow64_funcs) == unix_funcs_count );
+diff --git a/dlls/winemac.drv/unixlib.h b/dlls/winemac.drv/unixlib.h
+index dc22da0..bd9414e 100644
+--- a/dlls/winemac.drv/unixlib.h
++++ b/dlls/winemac.drv/unixlib.h
+@@ -23,6 +23,7 @@
+ {
+     unix_init,
+     unix_quit_result,
++    unix_file_dialog,
+     unix_funcs_count
+ };
+ 
+@@ -49,6 +50,30 @@
+     int result;
+ };
+ 
++/* macdrv_file_dialog params (MacSW native file dialogs); same layout on 32 and 64 bit */
++enum macdrv_file_dialog_op
++{
++    MACDRV_FILE_DIALOG_BEGIN,
++    MACDRV_FILE_DIALOG_POLL,
++    MACDRV_FILE_DIALOG_UPDATE,
++    MACDRV_FILE_DIALOG_CANCEL,
++    MACDRV_FILE_DIALOG_RELEASE,
++};
++
++struct file_dialog_params
++{
++    UINT32 op;
++    UINT32 dialog;
++    UINT32 owner;
++    UINT32 in_len;
++    UINT64 in;
++    UINT64 out;
++    UINT32 out_size;
++    UINT32 out_len;
++    INT32  result;
++    UINT32 pad;
++};
++
+ /* macdrv_app_icon result */
+ struct app_icon_entry
+ {
+diff --git a/dlls/winemac.drv/winemac.drv.spec b/dlls/winemac.drv/winemac.drv.spec
+new file mode 100644
+index 0000000..09381ee
+--- /dev/null
++++ b/dlls/winemac.drv/winemac.drv.spec
+@@ -0,0 +1,2 @@
++# MacSW: native file dialogs for comdlg32 (MACSW_NATIVE_FILE_DIALOGS)
++@ stdcall -private macsw_file_dialog(long long long ptr long ptr long ptr)

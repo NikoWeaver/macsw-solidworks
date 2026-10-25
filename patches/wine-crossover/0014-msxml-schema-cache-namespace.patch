@@ -1,0 +1,102 @@
+diff --git a/dlls/msxml3/schema.c b/dlls/msxml3/schema.c
+--- a/dlls/msxml3/schema.c
++++ b/dlls/msxml3/schema.c
+@@ -748,6 +748,74 @@
+     return TRUE;
+ }
+ 
++/* Adopt unqualified schema QNames without changing element/attribute forms,
++ * XPath expressions, existing namespace bindings or the caller's DOM. */
++static BOOL adopt_schema_qnames(xmlNodePtr node, const xmlChar *uri)
++{
++    static const char * const names[] = {"type", "ref", "base", "itemType", "memberTypes",
++                                       "substitutionGroup", "refer"};
++    for (; node; node = node->next)
++    {
++        xmlNsPtr default_ns;
++        unsigned int i;
++
++        if (node->type != XML_ELEMENT_NODE) continue;
++        if (node->ns && xmlStrEqual(node->ns->href, XSD_nsURI))
++        {
++            if (xmlStrEqual(node->name, BAD_CAST "annotation")) continue;
++            default_ns = xmlSearchNs(node->doc, node, NULL);
++            if (!default_ns || !default_ns->href || !*default_ns->href)
++            {
++                for (i = 0; i < ARRAY_SIZE(names); ++i)
++                {
++                    xmlChar *value = xmlGetNoNsProp(node, BAD_CAST names[i]);
++                    const xmlChar *start, *end;
++                    xmlBufferPtr buffer;
++                    xmlNsPtr ns;
++                    char prefix[32];
++                    unsigned int suffix = 0;
++
++                    if (!value) continue;
++                    do
++                    {
++                        snprintf(prefix, sizeof(prefix), "msxmlns%u", suffix++);
++                        ns = xmlSearchNs(node->doc, node, BAD_CAST prefix);
++                    } while (ns && !xmlStrEqual(ns->href, uri));
++                    if (!ns && !xmlNewNs(node, uri, BAD_CAST prefix)) { xmlFree(value); return FALSE; }
++                    if (!(buffer = xmlBufferCreate())) { xmlFree(value); return FALSE; }
++                    for (start = value; *start; start = end)
++                    {
++                        if (*start == ' ' || *start == '\t' || *start == '\n' || *start == '\r')
++                        {
++                            if (xmlBufferAdd(buffer, start, 1)) goto failed;
++                            end = start + 1;
++                            continue;
++                        }
++                        for (end = start; *end && *end != ' ' && *end != '\t' && *end != '\n' && *end != '\r'; ++end);
++                        if (!memchr(start, ':', end - start))
++                        {
++                            if (xmlBufferAdd(buffer, BAD_CAST prefix, -1) ||
++                                xmlBufferAdd(buffer, BAD_CAST ":", 1)) goto failed;
++                        }
++                        if (xmlBufferAdd(buffer, start, end - start)) goto failed;
++                    }
++                    if (!xmlSetProp(node, BAD_CAST names[i], xmlBufferContent(buffer)))
++                        goto failed;
++                    xmlBufferFree(buffer);
++                    xmlFree(value);
++                    continue;
++failed:
++                    xmlBufferFree(buffer);
++                    xmlFree(value);
++                    return FALSE;
++                }
++            }
++        }
++        if (!adopt_schema_qnames(node->children, uri)) return FALSE;
++    }
++    return TRUE;
++}
++
+ static cache_entry* cache_entry_from_xsd_doc(xmlDocPtr doc, xmlChar const* nsURI, MSXML_VERSION v)
+ {
+     cache_entry* entry = malloc(sizeof(cache_entry));
+@@ -756,8 +824,21 @@
+ 
+     link_datatypes(new_doc);
+ 
+-    /* TODO: if the nsURI is different from the default xmlns or targetNamespace,
+-     *       do we need to do something special here? */
++    /* MSXML adopts a no-target-namespace schema into the cache namespace.
++     * Work only on the private copy; never modify the caller's DOM. */
++    if (nsURI && *nsURI)
++    {
++        xmlNodePtr root = xmlDocGetRootElement(new_doc);
++        if (root && !xmlHasNsProp(root, BAD_CAST "targetNamespace", NULL))
++        {
++            if (!xmlSetProp(root, BAD_CAST "targetNamespace", nsURI) || !adopt_schema_qnames(root, nsURI))
++            {
++                xmlFreeDoc(new_doc);
++                free(entry);
++                return NULL;
++            }
++        }
++    }
+     entry->type = CacheEntryType_XSD;
+     entry->ref = 0;
+     spctx = xmlSchemaNewDocParserCtxt(new_doc);

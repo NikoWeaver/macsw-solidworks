@@ -1,0 +1,193 @@
+diff --git a/dlls/winemac.drv/opengl.c b/dlls/winemac.drv/opengl.c
+--- a/dlls/winemac.drv/opengl.c
++++ b/dlls/winemac.drv/opengl.c
+@@ -103,6 +103,9 @@
+ /* Only bitmap formats use this legacy share group. Ordinary window and
+  * pbuffer contexts keep their original CGL activation and sharing paths. */
+ static CGLContextObj bitmap_context;
++static BOOL bitmap_accelerated;
++static BOOL software_renderer;
++static BOOL force_software_renderer;
+ static pthread_mutex_t bitmap_mutex = PTHREAD_MUTEX_INITIALIZER;
+ static GLint bitmap_max_size;
+ static PFN_glBindFramebufferEXT pglBindFramebufferEXT;
+@@ -644,12 +647,18 @@
+     unsigned int double_buffer;
+     unsigned int accelerated = renderer.accelerated;
+
++    if (force_software_renderer && accelerated)
++    {
++        TRACE("ignoring accelerated renderer for explicit software test selection\n");
++        return;
++    }
++
+     if (accelerated)
+     {
+         attribs[n++] = kCGLPFAAccelerated;
+         attribs[n++] = kCGLPFANoRecovery;
+     }
+-    else if (!allow_software_rendering)
++    else if (!allow_software_rendering && !software_renderer)
+     {
+         TRACE("ignoring software renderer because AllowSoftwareRendering is off\n");
+         return;
+@@ -1185,7 +1194,8 @@
+             if (bitmap_context)
+             {
+                 pixel_format bitmap = {0};
+-                bitmap.accelerated = bitmap.bitmap = 1;
++                bitmap.bitmap = 1;
++                bitmap.accelerated = bitmap_accelerated;
+                 bitmap.depth_bits = 24;
+                 bitmap.stencil_bits = 8;
+                 bitmap.color_mode = 8; /* kCGLRGB888Bit */
+@@ -1236,37 +1246,96 @@
+     return NULL;
+ }
+
+-static CGLContextObj init_context(CGLOpenGLProfile profile)
++/* Process-local diagnostics only. Default behavior and registry policy stay unchanged. */
++static BOOL select_renderer(const char *selection)
++{
++    if (!selection || !strcmp(selection, "auto")) force_software_renderer = FALSE;
++    else if (!strcmp(selection, "software")) force_software_renderer = TRUE;
++    else
++    {
++        WARN("Invalid MACSW_OPENGL_RENDERER '%s'; expected auto or software\n", selection);
++        return FALSE;
++    }
++    return TRUE;
++}
++
++static CGLContextObj init_context(CGLOpenGLProfile profile, BOOL *accelerated)
+ {
+     CGLPixelFormatAttribute attribs[] =
+     {
+         kCGLPFADisplayMask, CGDisplayIDToOpenGLDisplayMask(CGMainDisplayID()),
+         kCGLPFAAccelerated, kCGLPFAOpenGLProfile, (CGLPixelFormatAttribute)profile, 0,
+     };
+-    CGLPixelFormatObj pix;
+-    CGLContextObj context;
+-    GLint screens;
++    CGLPixelFormatObj pix = NULL;
++    CGLContextObj context = NULL, old_context = CGLGetCurrentContext();
++    GLint screens, screen, value;
+     CGLError err;
+
+-    if ((err = CGLChoosePixelFormat(attribs, &pix, &screens)) || !pix)
++    if (force_software_renderer)
++    {
++        attribs[0] = kCGLPFARendererID;
++        attribs[1] = kCGLRendererGenericFloatID;
++        attribs[2] = kCGLPFAOpenGLProfile;
++        attribs[3] = (CGLPixelFormatAttribute)profile;
++        attribs[4] = 0;
++    }
++    err = CGLChoosePixelFormat(attribs, &pix, &screens);
++    if (!force_software_renderer && profile == kCGLOGLPVersion_Legacy &&
++        (err == kCGLBadPixelFormat || (!err && !pix)))
++    {
++        /* Keep the accelerated display request first. Only a missing format
++         * permits software initialization, not allocation/create/bind errors.
++         * Never substitute legacy software for a requested core profile. */
++        WARN("Accelerated legacy pixel format unavailable (%d); trying Apple software renderer\n", err);
++        if (pix) CGLReleasePixelFormat(pix);
++        pix = NULL;
++        attribs[0] = kCGLPFARendererID;
++        attribs[1] = kCGLRendererGenericFloatID;
++        attribs[2] = kCGLPFAOpenGLProfile;
++        attribs[3] = (CGLPixelFormatAttribute)profile;
++        attribs[4] = 0;
++        err = CGLChoosePixelFormat(attribs, &pix, &screens);
++    }
++    if (err || !pix)
+     {
+         WARN("CGLChoosePixelFormat() failed with error %d %s\n", err, CGLErrorString(err));
++        if (pix) CGLReleasePixelFormat(pix);
+         return NULL;
+     }
+     if ((err = CGLCreateContext(pix, NULL, &context)) || !context)
+     {
+         WARN("CGLCreateContext() failed with error %d %s\n", err, CGLErrorString(err));
+-        context = NULL;
++        if (context) CGLReleaseContext(context);
++        CGLReleasePixelFormat(pix);
++        return NULL;
+     }
++
++    if ((err = CGLGetVirtualScreen(context, &screen)) ||
++        (err = CGLDescribePixelFormat(pix, screen, kCGLPFAAccelerated, &value)))
++    {
++        WARN("Failed to query context acceleration: %d %s\n", err, CGLErrorString(err));
++        CGLReleaseContext(context);
++        CGLReleasePixelFormat(pix);
++        return NULL;
++    }
+     CGLReleasePixelFormat(pix);
++    if (force_software_renderer && value)
++    {
++        WARN("Explicit software selection returned an accelerated context\n");
++        CGLReleaseContext(context);
++        return NULL;
++    }
+
+     if ((err = CGLSetCurrentContext(context)))
+     {
+         WARN("CGLSetCurrentContext() failed with error %d %s\n", err, CGLErrorString(err));
++        CGLSetCurrentContext(old_context);
+         CGLReleaseContext(context);
+         return NULL;
+     }
+
++    if (accelerated) *accelerated = !!value;
++    TRACE("Initialized profile %#x, accelerated %u\n", profile, !!value);
+     return context;
+ }
+
+@@ -1277,10 +1346,15 @@
+
+     CGLContextObj context;
+     CGLContextObj old_context = CGLGetCurrentContext();
++    BOOL accelerated;
+     const char *str;
+     size_t length;
+
+-    if (!(context = init_context(kCGLOGLPVersion_Legacy))) return FALSE;
++    if (!select_renderer(getenv("MACSW_OPENGL_RENDERER"))) return FALSE;
++    if (!(context = init_context(kCGLOGLPVersion_Legacy, &accelerated))) return FALSE;
++    /* Allow enumeration for this fallback only; do not change the registry
++     * policy or expose software formats when hardware initialization worked. */
++    software_renderer = !accelerated;
+     str = (const char*)pglGetString(GL_EXTENSIONS);
+     length = strlen(str) + sizeof(legacy_extensions);
+     if (allow_vsync)
+@@ -1307,14 +1381,18 @@
+         gluCheckExtension((GLubyte*)"GL_EXT_packed_depth_stencil", (GLubyte*)gl_info.glExtensions))
+     {
+         pglGetIntegerv(GL_MAX_RENDERBUFFER_SIZE_EXT, &bitmap_max_size);
+-        if (bitmap_max_size > 0) bitmap_context = CGLRetainContext(context);
++        if (bitmap_max_size > 0)
++        {
++            bitmap_context = CGLRetainContext(context);
++            bitmap_accelerated = accelerated;
++        }
+     }
+
+     CGLSetCurrentContext(old_context);
+     CGLReleaseContext(context);
+     core_profile = kCGLOGLPVersion_Legacy;
+
+-    if (!(context = init_context(kCGLOGLPVersion_GL3_Core))) return TRUE;
++    if (!(context = init_context(kCGLOGLPVersion_GL3_Core, NULL))) return TRUE;
+     str = (const char*)pglGetString(GL_VERSION);
+     TRACE("GL3_Core context version: %s\n", str);
+     sscanf(str, "%u.%u", &gl_info.max_major, &gl_info.max_minor);
+@@ -1322,7 +1400,7 @@
+     CGLReleaseContext(context);
+     core_profile = kCGLOGLPVersion_GL3_Core;
+
+-    if (!(context = init_context(kCGLOGLPVersion_GL4_Core))) return TRUE;
++    if (!(context = init_context(kCGLOGLPVersion_GL4_Core, NULL))) return TRUE;
+     str = (const char*)pglGetString(GL_VERSION);
+     TRACE("GL4_Core context version: %s\n", str);
+     sscanf(str, "%u.%u", &gl_info.max_major, &gl_info.max_minor);

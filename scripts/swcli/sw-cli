@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONTENTS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+WINE_ROOT="${CONTENTS_DIR}/Frameworks/wine"
+WINELOADER="${WINE_ROOT}/bin/wineloader"
+WINESERVER="${WINE_ROOT}/bin/wineserver"
+SWCLI_RESOURCES="${CONTENTS_DIR}/Resources/SWCLI"
+WINEPREFIX="${MACSW_WINEPREFIX:-${HOME}/Library/Application Support/MacSW/bottle}"
+WINDOWS_PYTHON='C:\MacSW\Python311\python.exe'
+WINDOWS_PYTHONW='C:\MacSW\Python311\pythonw.exe'
+PYTHON_UNIX="${WINEPREFIX}/drive_c/MacSW/Python311/python.exe"
+PYTHONW_UNIX="${WINEPREFIX}/drive_c/MacSW/Python311/pythonw.exe"
+NATIVE_PYTHON="${SWCLI_RESOURCES}/runtime/PythonNative/bin/python3"
+NATIVE_SWCLI_SOURCE="${SWCLI_RESOURCES}/runtime/PythonNative/lib/python3.11/site-packages"
+NATIVE_PATH_HELPER="${SWCLI_RESOURCES}/bin/swcli-path"
+
+export WINEPREFIX
+export WINEDEBUG="${WINEDEBUG:--all}"
+export WINELOADER
+export WINESERVER
+# Wine locale: MACSW_WINE_LOCALE override, else the app preference MacSW.wineLocale
+# (Settings), else en_US.UTF-8. Only the supported values are accepted.
+WINE_LOCALE="${MACSW_WINE_LOCALE:-$(defaults read com.yjbeetle.macsw MacSW.wineLocale 2>/dev/null || true)}"
+case "${WINE_LOCALE}" in
+    en_US.UTF-8|zh_CN.UTF-8) ;;
+    *) WINE_LOCALE="en_US.UTF-8" ;;
+esac
+export LANG="${WINE_LOCALE}"
+export LC_ALL="${WINE_LOCALE}"
+# Keep CLI-created SOLIDWORKS hosts on the same compatibility profile as
+# WineService.environment(solidWorks: true). These native VC runtimes are
+# required by SOLIDWORKS; Wine's builtin concrt140 crashes during startup.
+export WINE_MONO_AOT="none"
+# Wine patch 0018: WebView2 panes need cross-process window surfaces (docs/webview2-under-wine.md).
+export MACSW_CROSS_PROCESS_SURFACES=1
+# Wine patches 0032/0033: start-up caches (docs/startup-performance.md).
+export MACSW_WIC_COMPONENT_CACHE=1 MACSW_LOCAL_MODULE_READS=1
+export WINEDLLOVERRIDES="atiadlxx=d;concrt140=n,b;msvcp140=n,b;msvcp140_1=n,b;msvcp140_2=n,b;msvcp140_atomic_wait=n,b;msvcp140_codecvt_ids=n,b;vcruntime140=n,b;vcruntime140_1=n,b;vcomp140=n,b;mfc140u=n,b"
+
+to_windows_path() {
+    "${NATIVE_PATH_HELPER}" "$1"
+}
+
+if [ ! -x "${WINELOADER}" ] || [ ! -x "${WINESERVER}" ]; then
+    echo "MacSW Wine runtime is incomplete: ${WINE_ROOT}" >&2
+    exit 1
+fi
+if [ ! -x "${NATIVE_PYTHON}" ] || [ ! -x "${NATIVE_PATH_HELPER}" ]; then
+    echo "MacSW native SWCLI runtime is incomplete; reinstall MacSW." >&2
+    exit 1
+fi
+
+export SWCLI_ENDPOINT="${SWCLI_ENDPOINT:-127.0.0.1:18495}"
+export SWCLI_HOST_PLATFORM="macos-wine"
+export PYTHONDONTWRITEBYTECODE=1
+
+require_windows_runtime() {
+    "${NATIVE_PYTHON}" -I "${SWCLI_RESOURCES}/bin/wine_runtime.py" check \
+        --contents "${CONTENTS_DIR}" --prefix "${WINEPREFIX}" || exit $?
+    # Stop/status must remain usable with the old backend when an upgrade is
+    # blocked by a live daemon. All other Windows entrypoints synchronize first.
+    if [ "${1:-}" != "existing" ]; then
+        "${NATIVE_PYTHON}" -I "${SWCLI_RESOURCES}/bin/swcli_runtime.py" \
+            --contents "${CONTENTS_DIR}" --prefix "${WINEPREFIX}" || exit $?
+    fi
+    if [ ! -f "${PYTHON_UNIX}" ] || [ ! -f "${PYTHONW_UNIX}" ]; then
+        echo "SWCLI Windows runtime is not installed in this MacSW bottle; reinstall SOLIDWORKS with MacSW." >&2
+        exit 1
+    fi
+    SWCLI_PATH_HELPER_WIN="$(to_windows_path "${SWCLI_RESOURCES}/bin/swcli_path.exe")"
+}
+
+run_windows_windowless_cli() {
+    if [ "${1:-}" = "daemon" ] && { [ "${2:-}" = "stop" ] || [ "${2:-}" = "status" ]; }; then
+        require_windows_runtime existing
+    else
+        require_windows_runtime
+    fi
+    local output_file output_windows status
+    output_file="$(mktemp "${TMPDIR:-/tmp}/macsw-swcli.XXXXXX")"
+    output_windows="$(to_windows_path "${output_file}")"
+    # pythonw avoids Wine's GUI console. Redirect Python streams explicitly because
+    # GUI-subsystem Python initializes sys.stdout/sys.stderr as None.
+    local bootstrap='import sys; output=sys.argv.pop(1); stream=open(output, "w", encoding="utf-8"); sys.stdout=stream; sys.stderr=stream; from swcli.cli import main; raise SystemExit(main())'
+    if env \
+        SWCLI_PATH_TRANSLATE_CMD="${SWCLI_PATH_HELPER_WIN}" \
+        SWCLI_POSIX_CWD_WIN="$(to_windows_path "${PWD}")" \
+        "${NATIVE_PYTHON}" -I "${SWCLI_RESOURCES}/bin/wine_runtime.py" launch \
+        --contents "${CONTENTS_DIR}" --prefix "${WINEPREFIX}" -- \
+        "${WINELOADER}" "${WINDOWS_PYTHONW}" -c "${bootstrap}" "${output_windows}" "$@"; then
+        status=0
+    else
+        status=$?
+    fi
+    if [ -s "${output_file}" ]; then
+        cat "${output_file}"
+    fi
+    rm -f -- "${output_file}"
+    return "${status}"
+}
+
+# Daemon ownership and visibility are explicit. Typed commands only connect to
+# an already running daemon and never start or attach to SOLIDWORKS implicitly.
+if [ "${1:-}" = "doctor" ] || { [ "${1:-}" = "daemon" ] && [ "${2:-}" != "serve" ]; }; then
+    if run_windows_windowless_cli "$@"; then
+        exit 0
+    else
+        exit $?
+    fi
+fi
+
+case "${1:-}" in
+    daemon)
+        require_windows_runtime
+        exec env \
+            SWCLI_PATH_TRANSLATE_CMD="${SWCLI_PATH_HELPER_WIN}" \
+            SWCLI_POSIX_CWD_WIN="$(to_windows_path "${PWD}")" \
+            "${NATIVE_PYTHON}" -I "${SWCLI_RESOURCES}/bin/wine_runtime.py" launch \
+            --contents "${CONTENTS_DIR}" --prefix "${WINEPREFIX}" -- \
+            "${WINELOADER}" "${WINDOWS_PYTHON}" -m swcli "$@"
+        ;;
+esac
+
+export PYTHONPATH="${NATIVE_SWCLI_SOURCE}"
+export SWCLI_PATH_TRANSLATE_CMD="${NATIVE_PATH_HELPER}"
+exec "${NATIVE_PYTHON}" -m swcli "$@"

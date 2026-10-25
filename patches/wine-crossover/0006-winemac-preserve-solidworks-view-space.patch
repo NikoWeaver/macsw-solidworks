@@ -1,0 +1,100 @@
+diff --git a/dlls/winemac.drv/keyboard.c b/dlls/winemac.drv/keyboard.c
+--- a/dlls/winemac.drv/keyboard.c
++++ b/dlls/winemac.drv/keyboard.c
+@@ -1105,6 +1105,46 @@ void macdrv_hotkey_press(const macdrv_event *event)
+ }
+ 
+ 
++/* SOLIDWORKS handles Space as a viewport shortcut. macOS Chinese IMEs consume
++ * an idle Space and send only composition/character messages, so the shortcut
++ * never sees VK_SPACE. Identify its graphics child by its MFC class and the
++ * swMdiClient ancestor; text controls must keep the normal IME path. */
++static BOOL solidworks_graphics_has_focus(void)
++{
++    static const WCHAR mdi_client[] = {'s','w','M','d','i','C','l','i','e','n','t'};
++    WCHAR class_buffer[128];
++    UNICODE_STRING class_name = {0, sizeof(class_buffer), class_buffer};
++    HWND focus = get_focus(), parent;
++    unsigned int depth;
++    int length, i;
++
++    if (!focus || !(length = NtUserGetClassName(focus, FALSE, &class_name))) return FALSE;
++    for (i = 0; i + 3 < length; ++i)
++        if (class_buffer[i] == ':' && class_buffer[i + 1] == '2' &&
++            class_buffer[i + 2] == 'b' && class_buffer[i + 3] == ':') break;
++    if (i + 3 >= length) return FALSE;
++
++    parent = focus;
++    for (depth = 0; depth < 8; ++depth)
++    {
++        parent = NtUserGetAncestor(parent, GA_PARENT);
++        if (!parent) break;
++        length = NtUserGetClassName(parent, FALSE, &class_name);
++        if (length == ARRAY_SIZE(mdi_client) &&
++            !memcmp(class_buffer, mdi_client, sizeof(mdi_client))) return TRUE;
++    }
++    return FALSE;
++}
++
++static BOOL idle_solidworks_view_space(UINT vkey, const BYTE *state)
++{
++    if (vkey != VK_SPACE || (state[VK_SHIFT] & 0x80) || (state[VK_CONTROL] & 0x80) ||
++        (state[VK_MENU] & 0x80) || (state[VK_LWIN] & 0x80) || (state[VK_RWIN] & 0x80))
++        return FALSE;
++    return solidworks_graphics_has_focus() && !macdrv_ime_has_marked_text();
++}
++
++
+ /***********************************************************************
+  *              ImeToAsciiEx (MACDRV.@)
+  */
+@@ -1137,6 +1177,9 @@ UINT macdrv_ImeToAsciiEx(UINT vkey, UINT vsc, const BYTE *state, HIMC himc)
+             return STATUS_NOT_IMPLEMENTED;
+     }
+ 
++    if (idle_solidworks_view_space(vkey, state))
++        return STATUS_NOT_IMPLEMENTED;
++
+     flags = thread_data->last_modifiers;
+     if (state[VK_SHIFT] & 0x80)
+         flags |= NX_SHIFTMASK;
+diff --git a/dlls/winemac.drv/macdrv_cocoa.h b/dlls/winemac.drv/macdrv_cocoa.h
+--- a/dlls/winemac.drv/macdrv_cocoa.h
++++ b/dlls/winemac.drv/macdrv_cocoa.h
+@@ -541,5 +541,6 @@ extern void macdrv_destroy_swapchain(macdrv_metal_swapchain swapchain);
+ extern uint32_t macdrv_window_background_color(void);
+ extern bool macdrv_send_keydown_to_input_source(int keyc, unsigned int flags, int repeat, void *data);
++extern bool macdrv_ime_has_marked_text(void);
+ extern bool macdrv_is_any_wine_window_visible(void);
+ 
+ 
+diff --git a/dlls/winemac.drv/cocoa_window.m b/dlls/winemac.drv/cocoa_window.m
+--- a/dlls/winemac.drv/cocoa_window.m
++++ b/dlls/winemac.drv/cocoa_window.m
+@@ -4276,6 +4276,26 @@ uint32_t macdrv_window_background_color(void)
+     return result;
+ }
+ 
++/* If the Cocoa input source has a pending composition, Space belongs to the
++ * candidate UI even while SOLIDWORKS' graphics view has Windows focus. */
++bool macdrv_ime_has_marked_text(void)
++{
++    __block bool marked = true; /* Missing Wine window: keep normal IME handling. */
++
++    OnMainThread(^{
++        WineWindow* window = (WineWindow*)[NSApp keyWindow];
++        if (![window isKindOfClass:[WineWindow class]])
++        {
++            window = (WineWindow*)[NSApp mainWindow];
++            if (![window isKindOfClass:[WineWindow class]])
++                window = [[WineApplicationController sharedController] frontWineWindow];
++        }
++        if (window)
++            marked = [[window contentView] hasMarkedText];
++    });
++    return marked;
++}
++
+ /***********************************************************************
+  *              macdrv_send_keydown_to_input_source
+  *

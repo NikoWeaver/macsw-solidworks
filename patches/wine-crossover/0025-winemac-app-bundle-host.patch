@@ -1,0 +1,267 @@
+From: MacSW maintainers
+Subject: [PATCH] winemac: Act as the main process of an app bundle when asked to.
+
+SOLIDWORKS.app (the MacSW launcher) re-executes its own executable as the Wine
+loader, so the Wine host process is that bundle's process: LaunchServices
+shows one Dock tile with the bundle's name and icon and sends the bundle's
+Apple events to it. The launcher sets MACSW_APP_BUNDLE to its bundle path.
+winemac honours the variables below only in the process whose main bundle is
+that path (realpath of both). Wine processes that the host starts inherit the
+variables, but they run MacSW.app's loader, whose main bundle is another
+directory, so nothing changes for them. The variables are read once.
+
+MACSW_APP_BUNDLE=<bundle path>: the bundle's Info.plist makes the process a
+regular app from launch (Dock tile while starting), so the one-time setup in
+transformProcessToForeground (menu, App Nap activity, icon) also runs once
+when the policy is already regular. The Quit menu item uses Command-Q, not
+Command-Option-Q.
+
+MACSW_OPEN_DOCUMENTS_HELPER=<program>: documents opened from Finder, the
+Dock or "open -a" (kAEOpenDocuments, at launch and while running) are passed
+as "<program> --open-documents <path>..." to that program, which hands them
+to the running Windows application. The helper is started with its native
+slice preferred, no inherited descriptors except stdout/stderr and default
+signal state. Otherwise the delegate reports that it does not implement
+-application:openURLs:, so AppKit behaves as before.
+
+MACSW_APP_QUIT=close: Quit (Command-Q, the Dock, the menu) posts WM_CLOSE to
+every top-level window of the process, as taskkill without /f does, and
+cancels the termination; the program asks to save and exits by itself. Log
+out, restart and shut down keep Wine's session-end path. Without the
+variable, Quit keeps Wine's path (WM_QUERYENDSESSION, WM_ENDSESSION, then
+the process ends).
+
+Outside that process nothing changes.
+diff --git a/dlls/winemac.drv/cocoa_app.m b/dlls/winemac.drv/cocoa_app.m
+index 102a5b7..bfcd580 100644
+--- a/dlls/winemac.drv/cocoa_app.m
++++ b/dlls/winemac.drv/cocoa_app.m
+@@ -18,6 +18,12 @@
+  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+  */
+ 
++#include <crt_externs.h>
++#include <fcntl.h>
++#include <limits.h>
++#include <mach/machine.h>
++#include <spawn.h>
++#include <sys/wait.h>
+ #import "cocoa_app.h"
+ #import "cocoa_cursorclipping.h"
+ #import "cocoa_event.h"
+@@ -73,6 +79,43 @@ static NSString* WineLocalizedString(unsigned int stringID)
+ }
+ 
+ 
++/***********************************************************************
++ *              is_app_bundle_host
++ *
++ * MacSW: SOLIDWORKS.app (the MacSW launcher) re-executes its own executable
++ * as the Wine loader and sets MACSW_APP_BUNDLE to its bundle path.  Only that
++ * process is the bundle's main process.  The Wine processes it starts inherit
++ * the variables, but they run MacSW.app's loader, whose main bundle is another
++ * directory, so they ignore them.  The variables are read once.
++ */
++static struct
++{
++    BOOL host;
++    const char* open_documents_helper;  /* MACSW_OPEN_DOCUMENTS_HELPER */
++    BOOL quit_closes_windows;           /* MACSW_APP_QUIT=close */
++} app_bundle;
++
++static BOOL is_app_bundle_host(void)
++{
++    static dispatch_once_t once;
++
++    dispatch_once(&once, ^{ @autoreleasepool {
++        const char* path = getenv("MACSW_APP_BUNDLE");
++        const char* value;
++        char want[PATH_MAX], have[PATH_MAX];
++
++        app_bundle.host = path && realpath(path, want) &&
++                          realpath([[[NSBundle mainBundle] bundlePath] fileSystemRepresentation], have) &&
++                          !strcmp(want, have);
++        if (!app_bundle.host) return;
++        if ((value = getenv("MACSW_OPEN_DOCUMENTS_HELPER")) && *value)
++            app_bundle.open_documents_helper = strdup(value);
++        app_bundle.quit_closes_windows = (value = getenv("MACSW_APP_QUIT")) && !strcmp(value, "close");
++    }});
++    return app_bundle.host;
++}
++
++
+ @implementation WineApplication
+ 
+ @synthesize wineController;
+@@ -223,7 +266,13 @@ static NSString* WineLocalizedString(unsigned int stringID)
+ 
+     - (void) transformProcessToForeground:(BOOL)activateIfTransformed
+     {
+-        if ([NSApp activationPolicy] != NSApplicationActivationPolicyRegular)
++        /* MacSW: the main process of an app bundle (is_app_bundle_host) is a regular app from
++           launch, so it has a Dock tile while starting; it still needs the one-time setup
++           below (menu, App Nap, icon) when its first window appears. */
++        static BOOL bundle_setup_done;
++        BOOL bundle_setup = !bundle_setup_done && is_app_bundle_host();
++
++        if ([NSApp activationPolicy] != NSApplicationActivationPolicyRegular || bundle_setup)
+         {
+             NSMenu* mainMenu;
+             NSMenu* submenu;
+@@ -231,6 +280,7 @@ static NSString* WineLocalizedString(unsigned int stringID)
+             NSString* title;
+             NSMenuItem* item;
+ 
++            bundle_setup_done = YES;
+             [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+ 
+             if (activateIfTransformed)
+@@ -270,7 +320,11 @@ static NSString* WineLocalizedString(unsigned int stringID)
+             else
+                 title = WineLocalizedString(STRING_MENU_ITEM_QUIT);
+             item = [submenu addItemWithTitle:title action:@selector(terminate:) keyEquivalent:@"q"];
+-            [item setKeyEquivalentModifierMask:NSEventModifierFlagCommand | NSEventModifierFlagOption];
++            /* MacSW: in an app bundle, Command-Q quits as in other Mac apps. */
++            if (is_app_bundle_host())
++                [item setKeyEquivalentModifierMask:NSEventModifierFlagCommand];
++            else
++                [item setKeyEquivalentModifierMask:NSEventModifierFlagCommand | NSEventModifierFlagOption];
+             item = [[[NSMenuItem alloc] init] autorelease];
+             [item setTitle:WineLocalizedString(STRING_MENU_WINE)];
+             [item setSubmenu:submenu];
+@@ -2266,6 +2320,64 @@ static NSString* WineLocalizedString(unsigned int stringID)
+         return YES;
+     }
+ 
++    /* MacSW: an app bundle launcher (SOLIDWORKS.app) execs the Wine loader in its own
++       process, so LaunchServices sends that bundle's open-documents events here. In that
++       process (is_app_bundle_host) with MACSW_OPEN_DOCUMENTS_HELPER set, the files go to
++       that helper, which hands them to the running Windows program. Otherwise the
++       delegate does not implement the method and AppKit behaves as before. */
++    - (BOOL) respondsToSelector:(SEL)selector
++    {
++        if (selector == @selector(application:openURLs:) &&
++            !(is_app_bundle_host() && app_bundle.open_documents_helper))
++            return NO;
++        return [super respondsToSelector:selector];
++    }
++
++    - (void) application:(NSApplication *)sender openURLs:(NSArray<NSURL *> *)urls
++    {
++        const char* helper = is_app_bundle_host() ? app_bundle.open_documents_helper : NULL;
++        /* The Wine host runs under Rosetta; start the helper's native slice. */
++        cpu_type_t binpref[] = { CPU_TYPE_ARM64, CPU_TYPE_X86_64 };
++        posix_spawn_file_actions_t actions;
++        posix_spawnattr_t attr;
++        sigset_t all, none;
++        size_t count = 0;
++        char** argv;
++        pid_t pid;
++        int err;
++
++        if (!helper || ![urls count]) return;
++        argv = calloc([urls count] + 3, sizeof(*argv));
++        if (!argv) return;
++        argv[count++] = (char*)helper;
++        argv[count++] = (char*)"--open-documents";
++        for (NSURL* url in urls)
++            if ([url isFileURL]) argv[count++] = (char*)[url fileSystemRepresentation];
++
++        sigfillset(&all);
++        sigemptyset(&none);
++        posix_spawnattr_init(&attr);
++        posix_spawnattr_setflags(&attr, POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK);
++        posix_spawnattr_setsigdefault(&attr, &all);
++        posix_spawnattr_setsigmask(&attr, &none);
++        posix_spawnattr_setbinpref_np(&attr, 2, binpref, NULL);
++        posix_spawn_file_actions_init(&actions);
++        posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0);
++        posix_spawn_file_actions_addinherit_np(&actions, 1);
++        posix_spawn_file_actions_addinherit_np(&actions, 2);
++
++        if (count > 2 && !(err = posix_spawn(&pid, helper, &actions, &attr, argv, *_NSGetEnviron())))
++            dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
++                waitpid(pid, NULL, 0);
++            });
++        else if (count > 2)
++            ERR(@"could not start %s: %d\n", helper, err);
++
++        posix_spawn_file_actions_destroy(&actions);
++        posix_spawnattr_destroy(&attr);
++        free(argv);
++    }
++
+     - (NSApplicationTerminateReply) applicationShouldTerminate:(NSApplication *)sender
+     {
+         NSApplicationTerminateReply ret = NSTerminateNow;
+@@ -2273,6 +2385,7 @@ static NSString* WineLocalizedString(unsigned int stringID)
+         NSAppleEventDescriptor* desc = [m currentAppleEvent];
+         macdrv_event* event;
+         WineEventQueue* queue;
++        BOOL close_windows;
+ 
+         event = macdrv_create_event(APP_QUIT_REQUESTED, nil);
+         event->deliver = 1;
+@@ -2293,13 +2406,22 @@ static NSString* WineLocalizedString(unsigned int stringID)
+                 break;
+         }
+ 
++        /* MacSW: in an app bundle with MACSW_APP_QUIT=close, Quit (Command-Q, the Dock)
++           closes the program's windows as MacSW's "Quit SOLIDWORKS" (taskkill) does: the
++           program asks to save and exits by itself, so AppKit does not terminate now.
++           Log out, restart and shut down still end the Windows session. */
++        close_windows = event->app_quit_requested.reason == QUIT_REASON_NONE &&
++                        is_app_bundle_host() && app_bundle.quit_closes_windows;
++        if (close_windows)
++            event->app_quit_requested.reason = QUIT_REASON_CLOSE_WINDOWS;
++
+         [eventQueuesLock lock];
+ 
+         if ([eventQueues count])
+         {
+             for (queue in eventQueues)
+                 [queue postEvent:event];
+-            ret = NSTerminateLater;
++            ret = close_windows ? NSTerminateCancel : NSTerminateLater;
+         }
+ 
+         [eventQueuesLock unlock];
+diff --git a/dlls/winemac.drv/macdrv_cocoa.h b/dlls/winemac.drv/macdrv_cocoa.h
+index 45301de..ac1b50e 100644
+--- a/dlls/winemac.drv/macdrv_cocoa.h
++++ b/dlls/winemac.drv/macdrv_cocoa.h
+@@ -311,6 +311,7 @@ enum {
+     QUIT_REASON_LOGOUT,
+     QUIT_REASON_RESTART,
+     QUIT_REASON_SHUTDOWN,
++    QUIT_REASON_CLOSE_WINDOWS,  /* MacSW: app bundle Quit with MACSW_APP_QUIT=close */
+ };
+ 
+ typedef uint64_t macdrv_event_mask;
+diff --git a/dlls/winemac.drv/window.c b/dlls/winemac.drv/window.c
+index 6f0fbff..ba9a982 100644
+--- a/dlls/winemac.drv/window.c
++++ b/dlls/winemac.drv/window.c
+@@ -2183,6 +2183,22 @@ void macdrv_app_quit_requested(const macdrv_event *event)
+ 
+     TRACE("reason %d\n", event->app_quit_requested.reason);
+ 
++    /* MacSW: post WM_CLOSE to every top-level window of this process, as taskkill
++       without /f does. Cocoa has already cancelled the termination; the program asks
++       to save and exits by itself, or stays. */
++    if (event->app_quit_requested.reason == QUIT_REASON_CLOSE_WINDOWS)
++    {
++        HWND hwnd = NtUserGetWindowRelative(NtUserGetDesktopWindow(), GW_CHILD);
++        DWORD pid;
++
++        for (; hwnd; hwnd = NtUserGetWindowRelative(hwnd, GW_HWNDNEXT))
++        {
++            if (NtUserGetWindowThread(hwnd, &pid) && pid == GetCurrentProcessId())
++                NtUserPostMessage(hwnd, WM_CLOSE, 0, 0);
++        }
++        return;
++    }
++
+     if (event->app_quit_requested.reason == QUIT_REASON_LOGOUT)
+         params.flags = ENDSESSION_LOGOFF;
+ 

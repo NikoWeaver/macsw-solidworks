@@ -1,0 +1,64 @@
+diff --git a/dlls/combase/rpc.c b/dlls/combase/rpc.c
+--- a/dlls/combase/rpc.c
++++ b/dlls/combase/rpc.c
+@@ -622,6 +622,39 @@
+     return S_OK;
+ }
+ 
++/* SOLIDWORKS may take minutes to register its class factory on a cold disk.
++ * Keep waiting inside the original activation instead of starting another
++ * server or relying on the running object table (not guaranteed in Wine). */
++static unsigned int local_server_wait_seconds( REFCLSID clsid )
++{
++    static const GUID solidworks = {0x6af263bb,0xeb9f,0x4176,{0x89,0xe9,0x4f,0x89,0x2e,0xb0,0xca,0x3d}};
++    WCHAR value[64], *p;
++    DWORD length;
++    unsigned int seconds = 0;
++    BOOL fraction = FALSE;
++
++    if (!IsEqualGUID( clsid, &solidworks )) return 30;
++    length = GetEnvironmentVariableW( L"WINE_SOLIDWORKS_STARTUP_TIMEOUT", value, ARRAY_SIZE(value) );
++    if (!length) return 300;
++    if (length >= ARRAY_SIZE(value)) return 30;
++    p = value;
++    if (*p < '0' || *p > '9') return 30;
++    while (*p >= '0' && *p <= '9')
++    {
++        seconds = seconds * 10 + *p++ - '0';
++        if (seconds > 3600) return 30;
++    }
++    if (*p == '.')
++    {
++        p++;
++        if (*p < '0' || *p > '9') return 30;
++        while (*p >= '0' && *p <= '9')
++            fraction |= *p++ != '0';
++    }
++    if (*p || seconds + fraction > 3600) return 30;
++    return max( 1, seconds + fraction );
++}
++
+ HRESULT rpc_get_local_class_object(REFCLSID rclsid, REFIID riid, void **obj)
+ {
+     PMInterfacePointer objref = NULL;
+@@ -629,10 +662,10 @@
+     IStream *stream = NULL;
+     ULARGE_INTEGER newpos;
+     LARGE_INTEGER seekto;
+     int tries = 0;
++    const unsigned int MAXTRIES = local_server_wait_seconds( rclsid );
+     ULONG length;
+     HRESULT hr;
+-    static const int MAXTRIES = 30; /* 30 seconds */
+ 
+     TRACE("clsid %s, riid %s\n", debugstr_guid(rclsid), debugstr_guid(riid));
+ 
+@@ -666,7 +699,7 @@
+         if (process) CloseHandle(process);
+     }
+ 
+-    if (!objref || tries >= MAXTRIES)
++    if (!objref)
+         return E_NOINTERFACE;
+ 
+     if (SUCCEEDED(hr = CreateStreamOnHGlobal(0, TRUE, &stream)))

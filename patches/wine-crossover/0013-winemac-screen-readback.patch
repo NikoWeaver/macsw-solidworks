@@ -1,0 +1,157 @@
+diff --git a/dlls/winemac.drv/gdi.c b/dlls/winemac.drv/gdi.c
+--- a/dlls/winemac.drv/gdi.c
++++ b/dlls/winemac.drv/gdi.c
+@@ -25,6 +25,8 @@
+ 
+ #include "config.h"
+ 
++#include <limits.h>
++
+ #include "macdrv.h"
+ #include "winreg.h"
+ 
+@@ -229,14 +231,82 @@
+     pthread_mutex_unlock(&device_data_mutex);
+     return ret;
+ }
++
++
++static void free_screen_bits(struct gdi_image_bits *bits)
++{
++    free(bits->ptr);
++}
++
++static DWORD macdrv_GetImage(PHYSDEV dev, BITMAPINFO *info,
++                            struct gdi_image_bits *bits, struct bitblt_coords *src)
++{
++    CGImageRef image;
++    CGContextRef context;
++    CGColorSpaceRef color_space;
++    CGRect rect;
++    int width, height;
++    void *data;
++
++    if (NtUserWindowFromDC(dev->hdc) != NtUserGetDesktopWindow())
++    {
++        dev = GET_NEXT_PHYSDEV(dev, pGetImage);
++        return dev->funcs->pGetImage(dev, info, bits, src);
++    }
++
++    memset(&info->bmiHeader, 0, sizeof(info->bmiHeader));
++    info->bmiHeader.biSize = sizeof(info->bmiHeader);
++    info->bmiHeader.biPlanes = 1;
++    info->bmiHeader.biBitCount = 32;
++    info->bmiHeader.biCompression = BI_RGB;
++    if (!bits) return ERROR_SUCCESS;
++
++    width = src->visrect.right - src->visrect.left;
++    height = src->visrect.bottom - src->visrect.top;
++    if (width <= 0 || height <= 0 || (size_t)width * height > UINT_MAX / 4)
++        return ERROR_INVALID_PARAMETER;
+ 
++    rect = cgrect_mac_from_win(cgrect_from_rect(src->visrect));
++    image = macdrv_copy_screen_image(rect);
++    if (!image) return ERROR_NOT_SUPPORTED;
+ 
++    data = calloc(height, (size_t)width * 4);
++    color_space = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
++    context = data && color_space ? CGBitmapContextCreate(data, width, height, 8, (size_t)width * 4,
++                                         color_space, kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst) : NULL;
++    if (color_space) CGColorSpaceRelease(color_space);
++    if (!context)
++    {
++        CGImageRelease(image);
++        free(data);
++        return ERROR_OUTOFMEMORY;
++    }
++    CGContextSetInterpolationQuality(context, kCGInterpolationNone);
++    CGContextDrawImage(context, CGRectMake(0, 0, width, height), image);
++    CGContextRelease(context);
++    CGImageRelease(image);
++
++    info->bmiHeader.biWidth = width;
++    info->bmiHeader.biHeight = -height;
++    info->bmiHeader.biSizeImage = (size_t)width * height * 4;
++    bits->ptr = data;
++    bits->is_copy = TRUE;
++    bits->free = free_screen_bits;
++    bits->param = NULL;
++    src->x -= src->visrect.left;
++    src->y -= src->visrect.top;
++    OffsetRect(&src->visrect, -src->visrect.left, -src->visrect.top);
++    TRACE("screen capture %s %dx%d\n", wine_dbgstr_cgrect(rect), width, height);
++    return ERROR_SUCCESS;
++}
++
+ static const struct user_driver_funcs macdrv_funcs =
+ {
+     .dc_funcs.pCreateCompatibleDC = macdrv_CreateCompatibleDC,
+     .dc_funcs.pCreateDC = macdrv_CreateDC,
+     .dc_funcs.pDeleteDC = macdrv_DeleteDC,
+     .dc_funcs.pGetDeviceCaps = macdrv_GetDeviceCaps,
++    .dc_funcs.pGetImage = macdrv_GetImage,
+     .dc_funcs.pGetDeviceGammaRamp = macdrv_GetDeviceGammaRamp,
+     .dc_funcs.pSetDeviceGammaRamp = macdrv_SetDeviceGammaRamp,
+     .dc_funcs.priority = GDI_PRIORITY_GRAPHICS_DRV,
+diff --git a/dlls/winemac.drv/cocoa_window.m b/dlls/winemac.drv/cocoa_window.m
+--- a/dlls/winemac.drv/cocoa_window.m
++++ b/dlls/winemac.drv/cocoa_window.m
+@@ -3416,6 +3416,47 @@
+ 
+ 
+ /***********************************************************************
++ *              macdrv_copy_screen_image
++ */
++/* Keep host capture on the Cocoa thread, not the Windows thread's small stack.
++ * Resolve dynamically as in the dock snapshot path, since newer SDKs hide
++ * the legacy declarations.  Do not manufacture pixels if capture is denied. */
++CGImageRef macdrv_copy_screen_image(CGRect rect)
++{
++    static CGImageRef (*capture)(CGRect, CGWindowListOption, CGWindowID, CGWindowImageOption);
++    static dispatch_once_t once;
++    __block CGImageRef image = NULL;
++
++    dispatch_once(&once, ^{
++        void *library = dlopen("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics", RTLD_LAZY | RTLD_LOCAL);
++        if (library) capture = dlsym(library, "CGWindowListCreateImage");
++    });
++    if (!capture) return NULL;
++
++    OnMainThread(^{
++        @autoreleasepool {
++            /* A single Wine pixel may cover half a host point in Retina mode.
++             * Capture integral host bounds, then crop in backing pixels. */
++            CGRect bounds = CGRectIntegral(rect);
++            image = capture(bounds, kCGWindowListOptionOnScreenOnly, kCGNullWindowID,
++                            kCGWindowImageBoundsIgnoreFraming | kCGWindowImageBestResolution);
++            if (image && !CGRectEqualToRect(bounds, rect))
++            {
++                CGFloat sx = CGImageGetWidth(image) / bounds.size.width;
++                CGFloat sy = CGImageGetHeight(image) / bounds.size.height;
++                CGRect crop = CGRectMake((rect.origin.x - bounds.origin.x) * sx,
++                                         (rect.origin.y - bounds.origin.y) * sy,
++                                         rect.size.width * sx, rect.size.height * sy);
++                CGImageRef cropped = CGImageCreateWithImageInRect(image, crop);
++                CGImageRelease(image);
++                image = cropped;
++            }
++        }
++    });
++    return image;
++}
++
++/***********************************************************************
+  *              macdrv_create_cocoa_window
+  *
+  * Create a Cocoa window with the given content frame and features (e.g.
+diff --git a/dlls/winemac.drv/macdrv_cocoa.h b/dlls/winemac.drv/macdrv_cocoa.h
+--- a/dlls/winemac.drv/macdrv_cocoa.h
++++ b/dlls/winemac.drv/macdrv_cocoa.h
+@@ -509,6 +509,7 @@
+ extern void macdrv_get_cocoa_window_frame(macdrv_window w, CGRect* out_frame);
+ extern void macdrv_set_cocoa_parent_window(macdrv_window w, macdrv_window parent);
+ extern void macdrv_window_set_color_image(macdrv_window w, CGImageRef image, CGRect rect, CGRect dirty);
++extern CGImageRef macdrv_copy_screen_image(CGRect rect);
+ extern void macdrv_window_set_shape_image(macdrv_window w, CGImageRef image);
+ extern void macdrv_set_window_shape(macdrv_window w, const CGRect *rects, int count);
+ extern void macdrv_set_window_alpha(macdrv_window w, CGFloat alpha);

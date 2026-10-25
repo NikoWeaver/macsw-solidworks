@@ -1,0 +1,23 @@
+diff --git a/loader/wine_info.plist.in b/loader/wine_info.plist.in
+index 89f7460..6f29ef9 100644
+--- a/loader/wine_info.plist.in
++++ b/loader/wine_info.plist.in
+@@ -7,12 +7,14 @@
+     <key>CFBundleDevelopmentRegion</key>
+     <string>English</string>
+     <key>CFBundleExecutable</key>
+-    <string>wine</string>
++    <string>MacSW</string>
+     <key>CFBundleIdentifier</key>
+-    <string>org.winehq.wine</string>
++    <string>com.macsw.winehost</string>
+     <key>CFBundleInfoDictionaryVersion</key>
+     <string>6.0</string>
+     <key>CFBundleName</key>
+-    <string>Wine</string>
++    <string>MacSW</string>
++    <key>CFBundleDisplayName</key>
++    <string>MacSW</string>
+     <key>CFBundlePackageType</key>
+     <string>APPL</string>
+     <key>CFBundleShortVersionString</key>

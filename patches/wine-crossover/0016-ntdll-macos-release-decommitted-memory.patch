@@ -1,0 +1,74 @@
+From: MacSW maintainers
+Subject: [PATCH] ntdll: Release MEM_RESET pages on macOS by re-mapping them.
+
+MEM_RESET is implemented with madvise(MADV_DONTNEED). On macOS that call
+never lowers the process physical footprint, and MADV_FREE_REUSABLE /
+VM_BEHAVIOR_REUSABLE have no effect for x86_64 processes under Rosetta.
+Discarded pages therefore stay charged to the Wine process until they are
+decommitted or released.
+
+On macOS, replace committed, writable, non-executable pages of private
+anonymous (VirtualAlloc) views with a new anonymous mapping at the same
+host protection. MEM_RESET allows the contents to be discarded, the range
+stays mapped and committed, and Wine's view and per-page state are not
+changed. Section, image, system, guard, executable and force-exec memory
+keeps the existing madvise() call, as does every other platform.
+
+Decommit (decommit_pages) and release (unmap_area) already re-map or
+munmap the range and are not changed.
+
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -2503,6 +2503,43 @@ static NTSTATUS decommit_pages( struct file_view *view, char *base, size_t size
+ }
+ 
+ 
++/***********************************************************************
++ *           reset_pages
++ *
++ * Discard the contents of some committed pages (MEM_RESET).
++ * virtual_mutex must be held by caller.
++ */
++static void reset_pages( struct file_view *view, char *base, size_t size )
++{
++#ifdef __APPLE__
++    /* madvise(MADV_DONTNEED) leaves the pages charged to the physical footprint on macOS,
++     * and MADV_FREE_REUSABLE has no effect under Rosetta. Replacing the pages with a new
++     * anonymous mapping at the same protection releases them. Only do this for committed,
++     * writable, non-executable pages of private anonymous views; the range stays mapped.
++     * Anything else keeps the madvise() below. */
++    if (is_view_valloc( view ) && !(view->protect & VPROT_SYSTEM) && !force_exec_prot)
++    {
++        char *ptr = base, *end = base + size, *host_start, *host_end;
++        SIZE_T run;
++        BYTE vprot;
++
++        for (; ptr < end; ptr += run)
++        {
++            run = get_vprot_range_size( ptr, end - ptr, 0xff, &vprot );
++            host_start = (char *)ROUND_SIZE( 0, ptr, host_page_mask );
++            host_end = ROUND_ADDR( ptr + run, host_page_mask );
++            if ((vprot & (VPROT_COMMITTED | VPROT_WRITE | VPROT_WRITECOPY | VPROT_EXEC | VPROT_GUARD))
++                    != (VPROT_COMMITTED | VPROT_WRITE) || host_start >= host_end ||
++                anon_mmap_fixed( host_start, host_end - host_start, get_unix_prot( vprot ), 0 ) == MAP_FAILED)
++                madvise( ptr, run, MADV_DONTNEED );
++        }
++        return;
++    }
++#endif
++    madvise( base, size, MADV_DONTNEED );
++}
++
++
+ /***********************************************************************
+  *           remove_pages_from_view
+  *
+@@ -5232,7 +5269,7 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
+     else if (type & MEM_RESET)
+     {
+         if (!(view = find_view( base, size ))) status = STATUS_NOT_MAPPED_VIEW;
+-        else madvise( base, size, MADV_DONTNEED );
++        else reset_pages( view, base, size );
+     }
+     else  /* commit the pages */
+     {

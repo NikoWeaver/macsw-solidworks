@@ -1,0 +1,49 @@
+# Third-party parts of MacSW.app. scripts/third_party_notices.py turns this table into
+# Contents/Resources/THIRD_PARTY_NOTICES.txt at package time and stops the build when a part
+# of the bundle is not listed here, or a listed path is missing.
+#
+# Columns (tab-separated):
+#   component  version  licence  paths  source  texts  note
+# paths: comma-separated globs relative to Contents/. A row whose globs all start with "?"
+#   is optional (left out when nothing matches, e.g. SWCLI).
+# texts: comma-separated licence texts, each printed once at the end of the file:
+#   text:<file>    resources/licenses/third-party/<file> (copied from the project's release)
+#   wine:<file>    a file of the pinned Wine source archive (wine-<version>/<file>)
+#   bundle:<file>  a file already in the bundle, relative to Contents/
+#   repo:<file>    a file of this source tree
+# ${NAME} is replaced with a build value (config/versions.env, scripts/lib/config.sh).
+MacSW (fork of YJBeetle/MacSW)	${APP_VERSION} (build ${APP_BUILD})	Apache-2.0	MacOS/MacSW,?Resources/SOLIDWORKS.app.zip,?Resources/SOLIDWORKS.app.plist,Resources/helpers/msi_spatialiop.exe	https://github.com/NikoWeaver/macsw-solidworks (this fork; this build: see SOURCE.txt), based on https://github.com/YJBeetle/MacSW 69c5509	bundle:Resources/licenses/MacSW/NOTICE,bundle:Resources/licenses/MacSW/Apache-2.0.txt	A modified version of MacSW, not an official MacSW release. The MacSW launcher, the SOLIDWORKS.app launcher and the SpatialIOP MSI edit helper (native/msi_spatialiop.c, built with MinGW-w64).
+Wine	${WINE_VERSION}	LGPL-2.1-or-later	Resources/Wine/bin/*,Resources/Wine/lib/wine,Resources/Wine/share/wine/fonts,Resources/Wine/share/wine/nls,Resources/Wine/share/wine/wine.inf,Resources/Wine/share/wine/winmd	${WINE_SOURCE_URL} (SHA-256 ${WINE_SOURCE_SHA256}), plus MacSW's patches ${PATCHES} (see SOURCE.txt)	wine:LICENSE,wine:COPYING.LIB,repo:patches/wine-crossover/LICENSE,wine:NOTICES.md	The runtime is the Gcenx macOS Wine build ${WINE_RUNTIME_URL} (SHA-256 ${WINE_RUNTIME_SHA256}). MacSW replaces some of its modules with modules built from the Wine source above and patches ${PATCHES}. Wine contains code from other projects (libpng, zlib, libxml2, libxslt, LibJPEG, LibTIFF, Little CMS, FluidSynth, mpg123, vkd3d, ICU, OpenLDAP, musl, LLVM and more); their notices are in Wine's NOTICES.md below.
+GnuTLS	${GNUTLS_VERSION} (libgnutls.30)	LGPL-2.1-or-later	Resources/Wine/lib/libgnutls*	https://www.gnutls.org; source archive ${GNUTLS_SOURCE_URL}	wine:COPYING.LIB	From the Gcenx Wine runtime, unchanged (as all libraries in Resources/Wine/lib).
+Nettle	${NETTLE_VERSION} (libnettle.8.9, libhogweed.6.9)	LGPL-3.0-or-later OR GPL-2.0-or-later (used under LGPL-3.0-or-later)	Resources/Wine/lib/libnettle*,Resources/Wine/lib/libhogweed*	https://www.lysator.liu.se/~nisse/nettle/; source archive ${NETTLE_SOURCE_URL}	text:LGPL-3.0.txt,text:GPL-3.0.txt	The LGPL 3.0 adds terms to the GPL 3.0, so both texts apply.
+GMP	${GMP_VERSION}	LGPL-3.0-or-later OR GPL-2.0-or-later (used under LGPL-3.0-or-later)	Resources/Wine/lib/libgmp*	https://gmplib.org; source archive ${GMP_SOURCE_URL}	text:LGPL-3.0.txt,text:GPL-3.0.txt
+libtasn1	${LIBTASN1_VERSION}	LGPL-2.1-or-later	Resources/Wine/lib/libtasn1*	https://www.gnu.org/software/libtasn1/; source archive ${LIBTASN1_SOURCE_URL}	wine:COPYING.LIB
+libunistring	${LIBUNISTRING_VERSION} (libunistring.5)	LGPL-3.0-or-later OR GPL-2.0-or-later (used under LGPL-3.0-or-later)	Resources/Wine/lib/libunistring*	https://www.gnu.org/software/libunistring/; source archive ${LIBUNISTRING_SOURCE_URL}	text:LGPL-3.0.txt,text:GPL-3.0.txt
+libidn2	${LIBIDN2_VERSION}	LGPL-3.0-or-later OR GPL-2.0-or-later (used under LGPL-3.0-or-later); Unicode data under the Unicode licence	Resources/Wine/lib/libidn2*	https://www.gnu.org/software/libidn/#libidn2; source archive ${LIBIDN2_SOURCE_URL}	text:LGPL-3.0.txt,text:GPL-3.0.txt,text:libidn2-unicode.txt
+GNU libiconv	${LIBICONV_VERSION} (libiconv.2, libcharset.1)	LGPL-2.1-or-later	Resources/Wine/lib/libiconv*,Resources/Wine/lib/libcharset*	https://www.gnu.org/software/libiconv/; source archive ${LIBICONV_SOURCE_URL}	wine:COPYING.LIB
+GNU gettext (libintl)	${GETTEXT_VERSION} (libintl.8)	LGPL-2.1-or-later	Resources/Wine/lib/libintl*	https://www.gnu.org/software/gettext/; source archive ${GETTEXT_SOURCE_URL}	wine:COPYING.LIB
+p11-kit	libp11-kit.0	BSD-3-Clause	Resources/Wine/lib/libp11-kit*,Resources/Wine/lib/p11-kit-proxy.dylib	https://p11-glue.github.io/p11-glue/p11-kit.html	text:p11-kit.txt
+FreeType	libfreetype.6	FTL OR GPL-2.0-or-later (used under the FreeType License)	Resources/Wine/lib/libfreetype*	https://freetype.org	text:freetype.txt	Portions of this software are copyright © The FreeType Project (www.freetype.org). All rights reserved.
+ICU	76.1	Unicode-3.0	Resources/Wine/lib/libicu*	https://icu.unicode.org	text:ICU.txt
+MoltenVK	libMoltenVK	Apache-2.0	Resources/Wine/lib/libMoltenVK.dylib	https://github.com/KhronosGroup/MoltenVK	bundle:Resources/licenses/MacSW/Apache-2.0.txt	Copyright The Brenwill Workshop Ltd. Licensed under the Apache License, Version 2.0.
+Vulkan Loader	1.4.350	Apache-2.0	Resources/Wine/lib/libvulkan*	https://github.com/KhronosGroup/Vulkan-Loader	bundle:Resources/licenses/MacSW/Apache-2.0.txt	Copyright The Khronos Group Inc., Valve Corporation and LunarG, Inc. Licensed under the Apache License, Version 2.0.
+SDL2	2.32.8	Zlib	Resources/Wine/lib/libSDL2*	https://www.libsdl.org	text:SDL2.txt
+libxml2	libxml2.2	MIT	Resources/Wine/lib/libxml2*	https://gitlab.gnome.org/GNOME/libxml2	wine:libs/xml2/COPYING
+libxslt and libexslt	libxslt.1, libexslt.0	MIT	Resources/Wine/lib/libxslt*,Resources/Wine/lib/libexslt*	https://gitlab.gnome.org/GNOME/libxslt	wine:libs/xslt/COPYING
+libffi	libffi.8	MIT	Resources/Wine/lib/libffi*	https://sourceware.org/libffi/	text:libffi.txt
+Brotli	1.1.0	MIT	Resources/Wine/lib/libbrotli*	https://github.com/google/brotli	text:brotli.txt
+bzip2	1.0.8	bzip2-1.0.6	Resources/Wine/lib/libbz2*	https://sourceware.org/bzip2/	text:bzip2.txt
+LZ4	1.10.0	BSD-2-Clause	Resources/Wine/lib/liblz4*	https://github.com/lz4/lz4	text:lz4.txt
+XZ Utils (liblzma)	5.6.4	0BSD	Resources/Wine/lib/liblzma*	https://tukaani.org/xz/	text:xz-0BSD.txt
+Zstandard	1.5.6	BSD-3-Clause	Resources/Wine/lib/libzstd*	https://github.com/facebook/zstd	text:zstd.txt
+libpcap	1.10.5	BSD-3-Clause	Resources/Wine/lib/libpcap*	https://www.tcpdump.org	text:libpcap.txt
+libpng	1.6.45	libpng-2.0	Resources/Wine/lib/libpng*	http://www.libpng.org/pub/png/libpng.html	wine:libs/png/LICENSE
+zlib	1.3.1	Zlib	Resources/Wine/lib/libz.*	https://zlib.net	wine:libs/zlib/LICENSE
+libinotify-kqueue	libinotify.0	MIT	Resources/Wine/lib/libinotify*	https://github.com/libinotify-kqueue/libinotify-kqueue	text:libinotify-kqueue.txt
+MacPorts legacy-support	1.4.0	See upstream (MIT, BSD and APSL-2.0 parts)	Resources/Wine/lib/libMacportsLegacy*	https://github.com/macports/macports-legacy-support		The licence text is not in this file yet. It is in the upstream source at the address above.
+Wine Gecko	2.47.4	MPL-2.0 and others	Resources/Wine/share/wine/gecko	https://dl.winehq.org/wine/wine-gecko/2.47.4/	bundle:Resources/licenses/Gecko/license.html	Text of about:license from Gecko's omni.ja: the MPL 2.0 and the notices of the code Gecko includes.
+Wine Mono	${WINE_MONO_VERSION}, with ${MONO_PATCH_RELEASE}	MIT, LGPL-2.0 and others (see the files below)	Resources/Wine/share/wine/mono	https://github.com/wine-mono/wine-mono; see licenses/Mono/SOURCE.txt	bundle:Resources/licenses/Mono/LICENSE,bundle:Resources/licenses/Mono/COPYING.LIB,bundle:Resources/licenses/Mono/PATENTS.TXT,bundle:Resources/licenses/Mono/SOURCE.txt	MacSW replaces five files with patched builds (libmono-2.0-x86.dll, libmono-2.0-x86_64.dll, mscorlib.dll and the two regasm.exe in Resources/Wine/lib/wine).
+7-Zip	${SEVEN_Z_VERSION}	LGPL-2.1-or-later, BSD-3-Clause, and LGPL-2.1-or-later with the unRAR restriction	MacOS/7zz,MacOS/7z	https://www.7-zip.org (source: ${SEVEN_Z_SOURCE_URL})	text:7-Zip.txt,wine:COPYING.LIB	7zz is the unchanged macOS console build from 7-zip.org; 7z is a link to it.
+stdole	${STDOLE_VERSION}	Microsoft licence (http://go.microsoft.com/fwlink/?LinkID=746386)	Resources/managed/stdole.dll	https://www.nuget.org/packages/stdole/${STDOLE_VERSION}		© Microsoft Corporation. All rights reserved. Taken unchanged from the NuGet package (SHA-256 ${STDOLE_PACKAGE_SHA256}); the licence address is from the package's stdole.nuspec. That address now leads to Microsoft's pre-release licence terms for Visual Studio 2017, which allow evaluation use only and no distribution.
+Python (native, python-build-standalone)	${SWCLI_NATIVE_PYTHON_VERSION}, release ${SWCLI_NATIVE_PYTHON_RELEASE}	PSF-2.0, and the licences of the libraries it includes	Resources/SWCLI/runtime/PythonNative	https://github.com/astral-sh/python-build-standalone	bundle:Resources/SWCLI/licenses/Python-Native-LICENSE.txt	Runs MacSW's bottle tools (wine_runtime.py). pip's own licence files stay in the runtime (lib/python3.11/site-packages/pip-*.dist-info/licenses).
+SWCLI, Windows Python and pywin32	${SWCLI_VERSION}	See the files below	?Resources/SWCLI/runtime/Python311,?Resources/sw-cli,?MacOS/sw-cli	https://github.com/YJBeetle/SWCLI	bundle:Resources/SWCLI/licenses/SWCLI-LICENSE,bundle:Resources/SWCLI/licenses/Python-LICENSE.txt,bundle:Resources/SWCLI/licenses/pywin32-LICENSE.txt	Only in builds with MACSW_SKIP_SWCLI=0.

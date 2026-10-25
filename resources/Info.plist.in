@@ -1,0 +1,243 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>zh_CN</string>
+    <key>CFBundleExecutable</key>
+    <string>MacSW</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.yjbeetle.macsw</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>MacSW</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>@APP_VERSION@</string>
+    <key>CFBundleVersion</key>
+    <string>@APP_BUILD@</string>
+    <key>MacSWWineVersion</key>
+    <string>@WINE_VERSION@</string>
+    <key>MacSWMonoVersion</key>
+    <string>@WINE_MONO_VERSION@</string>
+    <key>MacSWMonoPatchSHA256</key>
+    <string>@MONO_PATCH_SHA256@</string>
+    <key>MacSWMonoMscorlibSHA256</key>
+    <string>@MONO_MSCORLIB_SHA256@</string>
+    <key>MacSWMonoRegAsmX86SHA256</key>
+    <string>@MONO_REGASM_X86_SHA256@</string>
+    <key>MacSWMonoRegAsmX64SHA256</key>
+    <string>@MONO_REGASM_X64_SHA256@</string>
+    <key>MacSWStdoleVersion</key>
+    <string>@STDOLE_VERSION@</string>
+    <key>MacSWStdoleSHA256</key>
+    <string>@STDOLE_DLL_SHA256@</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>@MACOS_DEPLOYMENT_TARGET@</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>MacSW needs to open macOS Terminal to run an interactive CMD in the current Wine bottle.</string>
+    <key>NSSupportsAutomaticGraphicsSwitching</key>
+    <true/>
+    <key>NSRequiresAquaSystemAppearance</key>
+    <false/>
+    <key>CFBundleDocumentTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeName</key><string>SOLIDWORKS Part</string>
+            <key>CFBundleTypeRole</key><string>Editor</string>
+            <key>LSHandlerRank</key><string>Default</string>
+            <key>LSItemContentTypes</key>
+            <array><string>com.dassault.solidworks.part</string></array>
+        </dict>
+        <dict>
+            <key>CFBundleTypeName</key><string>SOLIDWORKS Assembly</string>
+            <key>CFBundleTypeRole</key><string>Editor</string>
+            <key>LSHandlerRank</key><string>Default</string>
+            <key>LSItemContentTypes</key>
+            <array><string>com.dassault.solidworks.assembly</string></array>
+        </dict>
+        <dict>
+            <key>CFBundleTypeName</key><string>SOLIDWORKS Drawing</string>
+            <key>CFBundleTypeRole</key><string>Editor</string>
+            <key>LSHandlerRank</key><string>Default</string>
+            <key>LSItemContentTypes</key>
+            <array><string>com.dassault.solidworks.drawing</string></array>
+        </dict>
+        <dict>
+            <key>CFBundleTypeName</key><string>SOLIDWORKS Part Template</string>
+            <key>CFBundleTypeRole</key><string>Editor</string>
+            <key>LSHandlerRank</key><string>Default</string>
+            <key>LSItemContentTypes</key>
+            <array><string>com.dassault.solidworks.part-template</string></array>
+        </dict>
+        <dict>
+            <key>CFBundleTypeName</key><string>SOLIDWORKS Assembly Template</string>
+            <key>CFBundleTypeRole</key><string>Editor</string>
+            <key>LSHandlerRank</key><string>Default</string>
+            <key>LSItemContentTypes</key>
+            <array><string>com.dassault.solidworks.assembly-template</string></array>
+        </dict>
+        <dict>
+            <key>CFBundleTypeName</key><string>SOLIDWORKS Drawing Template</string>
+            <key>CFBundleTypeRole</key><string>Editor</string>
+            <key>LSHandlerRank</key><string>Default</string>
+            <key>LSItemContentTypes</key>
+            <array><string>com.dassault.solidworks.drawing-template</string></array>
+        </dict>
+        <dict>
+            <key>CFBundleTypeName</key><string>STEP CAD File</string>
+            <key>CFBundleTypeRole</key><string>Editor</string>
+            <key>LSHandlerRank</key><string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array><string>org.iso.step</string></array>
+        </dict>
+        <dict>
+            <key>CFBundleTypeName</key><string>IGES CAD File</string>
+            <key>CFBundleTypeRole</key><string>Editor</string>
+            <key>LSHandlerRank</key><string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array><string>org.iges.iges</string></array>
+        </dict>
+        <dict>
+            <key>CFBundleTypeName</key><string>Parasolid Text Part</string>
+            <key>CFBundleTypeRole</key><string>Editor</string>
+            <key>LSHandlerRank</key><string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array><string>com.siemens.parasolid.text</string></array>
+        </dict>
+        <dict>
+            <key>CFBundleTypeName</key><string>Parasolid Binary Part</string>
+            <key>CFBundleTypeRole</key><string>Editor</string>
+            <key>LSHandlerRank</key><string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array><string>com.siemens.parasolid.binary</string></array>
+        </dict>
+        <dict>
+            <key>CFBundleTypeName</key><string>DXF Drawing</string>
+            <key>CFBundleTypeRole</key><string>Editor</string>
+            <key>LSHandlerRank</key><string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array><string>com.autodesk.dxf</string></array>
+        </dict>
+        <dict>
+            <key>CFBundleTypeName</key><string>DWG Drawing</string>
+            <key>CFBundleTypeRole</key><string>Editor</string>
+            <key>LSHandlerRank</key><string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array><string>com.autodesk.dwg</string></array>
+        </dict>
+        <dict>
+            <key>CFBundleTypeName</key><string>STL Model</string>
+            <key>CFBundleTypeRole</key><string>Editor</string>
+            <key>LSHandlerRank</key><string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array><string>public.standard-tesselated-geometry-format</string></array>
+        </dict>
+    </array>
+    <key>UTImportedTypeDeclarations</key>
+    <array>
+        <dict>
+            <key>UTTypeIdentifier</key><string>com.dassault.solidworks.part</string>
+            <key>UTTypeDescription</key><string>SOLIDWORKS Part</string>
+            <key>UTTypeConformsTo</key>
+            <array><string>public.data</string><string>public.content</string></array>
+            <key>UTTypeTagSpecification</key>
+            <dict><key>public.filename-extension</key><array><string>sldprt</string></array></dict>
+        </dict>
+        <dict>
+            <key>UTTypeIdentifier</key><string>com.dassault.solidworks.assembly</string>
+            <key>UTTypeDescription</key><string>SOLIDWORKS Assembly</string>
+            <key>UTTypeConformsTo</key>
+            <array><string>public.data</string><string>public.content</string></array>
+            <key>UTTypeTagSpecification</key>
+            <dict><key>public.filename-extension</key><array><string>sldasm</string></array></dict>
+        </dict>
+        <dict>
+            <key>UTTypeIdentifier</key><string>com.dassault.solidworks.drawing</string>
+            <key>UTTypeDescription</key><string>SOLIDWORKS Drawing</string>
+            <key>UTTypeConformsTo</key>
+            <array><string>public.data</string><string>public.content</string></array>
+            <key>UTTypeTagSpecification</key>
+            <dict><key>public.filename-extension</key><array><string>slddrw</string></array></dict>
+        </dict>
+        <dict>
+            <key>UTTypeIdentifier</key><string>com.dassault.solidworks.part-template</string>
+            <key>UTTypeDescription</key><string>SOLIDWORKS Part Template</string>
+            <key>UTTypeConformsTo</key>
+            <array><string>public.data</string><string>public.content</string></array>
+            <key>UTTypeTagSpecification</key>
+            <dict><key>public.filename-extension</key><array><string>prtdot</string></array></dict>
+        </dict>
+        <dict>
+            <key>UTTypeIdentifier</key><string>com.dassault.solidworks.assembly-template</string>
+            <key>UTTypeDescription</key><string>SOLIDWORKS Assembly Template</string>
+            <key>UTTypeConformsTo</key>
+            <array><string>public.data</string><string>public.content</string></array>
+            <key>UTTypeTagSpecification</key>
+            <dict><key>public.filename-extension</key><array><string>asmdot</string></array></dict>
+        </dict>
+        <dict>
+            <key>UTTypeIdentifier</key><string>com.dassault.solidworks.drawing-template</string>
+            <key>UTTypeDescription</key><string>SOLIDWORKS Drawing Template</string>
+            <key>UTTypeConformsTo</key>
+            <array><string>public.data</string><string>public.content</string></array>
+            <key>UTTypeTagSpecification</key>
+            <dict><key>public.filename-extension</key><array><string>drwdot</string></array></dict>
+        </dict>
+        <dict>
+            <key>UTTypeIdentifier</key><string>org.iso.step</string>
+            <key>UTTypeDescription</key><string>STEP CAD File</string>
+            <key>UTTypeConformsTo</key>
+            <array><string>public.3d-content</string></array>
+            <key>UTTypeTagSpecification</key>
+            <dict><key>public.filename-extension</key><array><string>step</string><string>stp</string></array></dict>
+        </dict>
+        <dict>
+            <key>UTTypeIdentifier</key><string>org.iges.iges</string>
+            <key>UTTypeDescription</key><string>IGES CAD File</string>
+            <key>UTTypeConformsTo</key>
+            <array><string>public.3d-content</string></array>
+            <key>UTTypeTagSpecification</key>
+            <dict><key>public.filename-extension</key><array><string>iges</string><string>igs</string></array></dict>
+        </dict>
+        <dict>
+            <key>UTTypeIdentifier</key><string>com.siemens.parasolid.text</string>
+            <key>UTTypeDescription</key><string>Parasolid Text Part</string>
+            <key>UTTypeConformsTo</key>
+            <array><string>public.3d-content</string></array>
+            <key>UTTypeTagSpecification</key>
+            <dict><key>public.filename-extension</key><array><string>x_t</string></array></dict>
+        </dict>
+        <dict>
+            <key>UTTypeIdentifier</key><string>com.siemens.parasolid.binary</string>
+            <key>UTTypeDescription</key><string>Parasolid Binary Part</string>
+            <key>UTTypeConformsTo</key>
+            <array><string>public.3d-content</string></array>
+            <key>UTTypeTagSpecification</key>
+            <dict><key>public.filename-extension</key><array><string>x_b</string></array></dict>
+        </dict>
+        <dict>
+            <key>UTTypeIdentifier</key><string>com.autodesk.dxf</string>
+            <key>UTTypeDescription</key><string>DXF Drawing</string>
+            <key>UTTypeConformsTo</key>
+            <array><string>public.data</string></array>
+            <key>UTTypeTagSpecification</key>
+            <dict><key>public.filename-extension</key><array><string>dxf</string></array></dict>
+        </dict>
+        <dict>
+            <key>UTTypeIdentifier</key><string>com.autodesk.dwg</string>
+            <key>UTTypeDescription</key><string>DWG Drawing</string>
+            <key>UTTypeConformsTo</key>
+            <array><string>public.data</string></array>
+            <key>UTTypeTagSpecification</key>
+            <dict><key>public.filename-extension</key><array><string>dwg</string></array></dict>
+        </dict>
+    </array>
+</dict>
+</plist>

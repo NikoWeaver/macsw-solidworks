@@ -1,0 +1,10 @@
+# The paths that the public tree (scripts/make_public_tree.sh) and the release source archive
+# (scripts/stage_source_release.sh, which uses make_public_tree.sh) leave out. One path of the
+# tree per line; the text after "#" says why.
+docs/runtime-ci.md    # the upstream runtime CI and its licensing fixtures (plan E15)
+docs/TODO.md          # upstream's task list; it still ticks the old licence server check (E15)
+docs/superpowers      # upstream AI-tool plans (E15, E24)
+.codex                # upstream AI-tool settings (E24)
+README.cn.md          # describes upstream, not this fork (E24)
+docs/rc3-team.md      # the internal release log of the 0.2.0-rc.1 build (section f, step 3)
+docs/rc3.md           # the internal release log of RC3 (0.1.3), merged into 0.2.0-rc.2; it has local build paths

@@ -1,0 +1,17 @@
+diff --git a/dlls/winemac.drv/opengl.c b/dlls/winemac.drv/opengl.c
+index 33115223646..ad8cf7bb3b9 100644
+--- a/dlls/winemac.drv/opengl.c
++++ b/dlls/winemac.drv/opengl.c
+@@ -1982,7 +1982,11 @@ static void macdrv_surface_flush(struct opengl_drawable *base, UINT flags)
+     if (flags & GL_FLUSH_UPDATED) make_context_current(context, context->read_view == client->cocoa_view);
+     if (flags & GL_FLUSH_PRESENT)
+     {
+-        macdrv_flush_opengl_context(context->context);
++        /* win32u has already called glFlush() or glFinish() before asking the
++         * driver to present front-buffer rendering.  flushBuffer swaps a
++         * double-buffered NSOpenGLContext, which replaces the front buffer
++         * instead of merely making direct front-buffer drawing visible.
++         * Keep buffer exchange exclusive to macdrv_surface_swap(). */
+         client_surface_present(base->client);
+     }
+ }

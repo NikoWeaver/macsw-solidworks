@@ -1,0 +1,66 @@
+From: MacSW maintainers
+Subject: [PATCH] kernelbase: Read the own module list locally (MACSW_LOCAL_MODULE_READS=1).
+
+EnumProcessModules(), GetModuleBaseNameW(), GetModuleFileNameExW() and
+GetModuleInformation() walk the loader list of the target process with one
+ReadProcessMemory() per entry. NtReadVirtualMemory() copies locally only for
+the GetCurrentProcess() pseudo handle; a real handle to the own process
+(DuplicateHandle(GetCurrentProcess()), OpenProcess(GetCurrentProcessId()))
+makes one wineserver round trip per entry. SOLIDWORKS 2026 lists the modules
+of its own process this way while it starts (about 400 modules, one walk per
+module and call): 129,572 read_process_memory requests on its main thread
+before the main window.
+
+With MACSW_LOCAL_MODULE_READS=1, init_module_iterator() uses the pseudo handle
+when the process id of the handle is our own, so the walk reads local memory
+(NtReadVirtualMemory's existing __TRY/memmove path). The first read of each
+walk (LdrData from the PEB) still goes through the caller's handle, so the
+server checks PROCESS_VM_READ as before: a handle with only
+PROCESS_QUERY_(LIMITED_)INFORMATION still fails with ERROR_ACCESS_DENIED.
+The results are the same; other processes still go through the server.
+Without the variable nothing changes. MacSW sets it for SOLIDWORKS and
+sw-cli launches.
+
+diff --git a/dlls/kernelbase/debug.c b/dlls/kernelbase/debug.c
+index 8dbb677..01d7fe2 100644
+--- a/dlls/kernelbase/debug.c
++++ b/dlls/kernelbase/debug.c
+@@ -942,6 +942,25 @@ static BOOL init_module_iterator_wow64( struct module_iterator *iter, HANDLE pro
+ }
+ 
+ 
++/* MacSW: with MACSW_LOCAL_MODULE_READS=1, walk the module list of our own process through the
++ * current-process pseudo handle when the caller passed a real handle to it (DuplicateHandle or
++ * OpenProcess of our own pid). ReadProcessMemory then copies locally instead of making one
++ * wineserver round trip per list entry; the psapi functions below walk the list once per call.
++ * The first read of a walk still goes through the caller's handle, so a handle without
++ * PROCESS_VM_READ fails with ERROR_ACCESS_DENIED as in stock Wine. */
++static BOOL local_module_reads(void)
++{
++    static LONG enabled = -1;
++
++    if (enabled == -1)
++    {
++        WCHAR value[4];
++        DWORD len = GetEnvironmentVariableW( L"MACSW_LOCAL_MODULE_READS", value, ARRAY_SIZE(value) );
++        InterlockedExchange( &enabled, len == 1 && value[0] == '1' );
++    }
++    return enabled;
++}
++
+ static BOOL init_module_iterator( struct module_iterator *iter, HANDLE process )
+ {
+     PROCESS_BASIC_INFORMATION pbi;
+@@ -956,6 +975,12 @@ static BOOL init_module_iterator( struct module_iterator *iter, HANDLE process )
+     if (!ReadProcessMemory( process, &pbi.PebBaseAddress->LdrData, &ldr_data, sizeof(ldr_data), NULL ))
+         return FALSE;
+ 
++    /* MacSW: this first read went through the caller's handle, so the server has checked
++     * PROCESS_VM_READ as before; the rest of the walk of our own list is read locally. */
++    if (process != GetCurrentProcess() && pbi.UniqueProcessId == GetCurrentProcessId()
++        && local_module_reads())
++        process = GetCurrentProcess();
++
+     /* This happens when running "old" wow64 configuration. Mark it as such. */
+     if (!ldr_data)
+     {

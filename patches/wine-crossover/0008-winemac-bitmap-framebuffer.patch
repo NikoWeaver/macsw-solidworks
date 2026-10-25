@@ -1,0 +1,398 @@
+diff --git a/dlls/winemac.drv/opengl.c b/dlls/winemac.drv/opengl.c
+index 6b2ec0b..61d5221 100644
+--- a/dlls/winemac.drv/opengl.c
++++ b/dlls/winemac.drv/opengl.c
+@@ -40,6 +40,7 @@
+ #include <OpenGL/glu.h>
+ #include <OpenGL/CGLRenderers.h>
+ #include <dlfcn.h>
++#include <pthread.h>
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(wgl);
+ 
+@@ -69,12 +70,15 @@ struct macdrv_context
+     macdrv_view             read_view;
+     CGLPBufferObj           read_pbuffer;
+     int                     swap_interval;
++    BOOL                    bitmap_initialized;
+ };
+ 
+ struct gl_drawable
+ {
+     struct opengl_drawable  base;
+     CGLPBufferObj           pbuffer;
++    GLuint                 color_buffer;
++    GLuint                 depth_buffer;
+ };
+ 
+ static struct gl_drawable *impl_from_opengl_drawable(struct opengl_drawable *base)
+@@ -96,6 +100,21 @@ static PFN_glGetIntegerv pglGetIntegerv;
+ static void (*pglReadPixels)(GLint x, GLint y, GLsizei width, GLsizei height,
+                              GLenum format, GLenum type, void *pixels);
+ 
++/* Only bitmap formats use this legacy share group. Ordinary window and
++ * pbuffer contexts keep their original CGL activation and sharing paths. */
++static CGLContextObj bitmap_context;
++static pthread_mutex_t bitmap_mutex = PTHREAD_MUTEX_INITIALIZER;
++static GLint bitmap_max_size;
++static PFN_glBindFramebufferEXT pglBindFramebufferEXT;
++static PFN_glGenFramebuffersEXT pglGenFramebuffersEXT;
++static PFN_glDeleteFramebuffersEXT pglDeleteFramebuffersEXT;
++static PFN_glCheckFramebufferStatusEXT pglCheckFramebufferStatusEXT;
++static PFN_glFramebufferRenderbufferEXT pglFramebufferRenderbufferEXT;
++static PFN_glBindRenderbufferEXT pglBindRenderbufferEXT;
++static PFN_glGenRenderbuffersEXT pglGenRenderbuffersEXT;
++static PFN_glDeleteRenderbuffersEXT pglDeleteRenderbuffersEXT;
++static PFN_glRenderbufferStorageEXT pglRenderbufferStorageEXT;
++
+ 
+ struct color_mode {
+     GLint   mode;
+@@ -214,6 +233,7 @@ typedef struct {
+     unsigned int sample_buffers:1;
+     unsigned int samples:5;
+     unsigned int backing_store:1;
++    unsigned int bitmap:1;
+ } pixel_format;
+ 
+ 
+@@ -1144,7 +1164,7 @@ static UINT macdrv_init_pixel_formats(UINT *onscreen_count)
+     range = CFRangeMake(0, CFArrayGetCount(pixel_format_array));
+     if (range.length)
+     {
+-        pixel_formats = malloc(range.length * sizeof(*pixel_formats));
++        pixel_formats = calloc(range.length + 2, sizeof(*pixel_formats));
+         if (pixel_formats)
+         {
+             CFArraySortValues(pixel_format_array, range, pixel_format_comparator, NULL);
+@@ -1160,6 +1180,19 @@ static UINT macdrv_init_pixel_formats(UINT *onscreen_count)
+             }
+ 
+             nb_formats = range.length;
++            /* Append, never renumber, the window and pbuffer formats. These
++             * bitmap-only formats have exactly the storage we implement. */
++            if (bitmap_context)
++            {
++                pixel_format bitmap = {0};
++                bitmap.accelerated = bitmap.bitmap = 1;
++                bitmap.depth_bits = 24;
++                bitmap.stencil_bits = 8;
++                bitmap.color_mode = 8; /* kCGLRGB888Bit */
++                pixel_formats[nb_formats++] = bitmap;
++                bitmap.color_mode = 9; /* kCGLARGB8888Bit */
++                pixel_formats[nb_formats++] = bitmap;
++            }
+             TRACE("Total number of unique pixel formats: %d\n", nb_formats);
+         }
+         else
+@@ -1265,6 +1298,18 @@ static BOOL init_gl_info(void)
+     TRACE("GL version   : %s\n", str);
+     TRACE("GL renderer  : %s\n", pglGetString(GL_RENDERER));
+ 
++    if (pglBindFramebufferEXT && pglGenFramebuffersEXT && pglDeleteFramebuffersEXT &&
++        pglCheckFramebufferStatusEXT && pglFramebufferRenderbufferEXT &&
++        pglBindRenderbufferEXT && pglGenRenderbuffersEXT && pglDeleteRenderbuffersEXT &&
++        pglRenderbufferStorageEXT &&
++        gluCheckExtension((GLubyte*)"GL_EXT_framebuffer_object", (GLubyte*)gl_info.glExtensions) &&
++        gluCheckExtension((GLubyte*)"GL_EXT_framebuffer_blit", (GLubyte*)gl_info.glExtensions) &&
++        gluCheckExtension((GLubyte*)"GL_EXT_packed_depth_stencil", (GLubyte*)gl_info.glExtensions))
++    {
++        pglGetIntegerv(GL_MAX_RENDERBUFFER_SIZE_EXT, &bitmap_max_size);
++        if (bitmap_max_size > 0) bitmap_context = CGLRetainContext(context);
++    }
++
+     CGLSetCurrentContext(old_context);
+     CGLReleaseContext(context);
+     core_profile = kCGLOGLPVersion_Legacy;
+@@ -1309,6 +1354,17 @@ static BOOL create_context(struct macdrv_context *context, CGLContextObj share,
+         return FALSE;
+     }
+ 
++    if (pf->bitmap)
++    {
++        if (context->core || !bitmap_context)
++        {
++            RtlSetLastWin32Error(ERROR_INVALID_PIXEL_FORMAT);
++            return FALSE;
++        }
++        share = bitmap_context;
++        *shared = FALSE; /* not the win32u global (core-profile) share group */
++    }
++
+     attribs[n++] = kCGLPFAMinimumPolicy;
+     attribs[n++] = kCGLPFAClosestPolicy;
+ 
+@@ -1376,7 +1432,14 @@ static BOOL create_context(struct macdrv_context *context, CGLContextObj share,
+ 
+     attribs[n] = 0;
+ 
+-    err = CGLChoosePixelFormat(attribs, &pix, &virtualScreens);
++    if (pf->bitmap)
++    {
++        /* The advertised depth/color belong to the FBO, not a CGL drawable.
++         * Use the identical native format to guarantee CGL share compatibility. */
++        pix = CGLRetainPixelFormat(CGLGetPixelFormat(bitmap_context));
++        err = kCGLNoError;
++    }
++    else err = CGLChoosePixelFormat(attribs, &pix, &virtualScreens);
+     if (err != kCGLNoError || !pix)
+     {
+         WARN("CGLChoosePixelFormat() failed with error %d %s\n", err, CGLErrorString(err));
+@@ -1456,7 +1519,7 @@ static void macdrv_surface_destroy(struct opengl_drawable *base)
+ static void make_context_current(struct macdrv_context *context, BOOL read)
+ {
+     macdrv_view view;
+-    RECT view_rect;
++    RECT view_rect = {0};
+     CGLPBufferObj pbuffer;
+ 
+     if (read)
+@@ -2048,6 +2111,12 @@ static UINT macdrv_pbuffer_bind(HDC hdc, struct opengl_drawable *base, GLenum so
+ 
+     TRACE("hdc %p drawable %s source 0x%x\n", hdc, debugstr_opengl_drawable(base), source);
+ 
++    if (pixel_formats[base->format - 1].bitmap)
++    {
++        RtlSetLastWin32Error(ERROR_INVALID_OPERATION);
++        return GL_FALSE;
++    }
++
+     if (!context->draw_view && context->draw_pbuffer == pbuffer && source != GL_NONE)
+         funcs->p_glFlush();
+ 
+@@ -2183,6 +2252,68 @@ static BOOL macdrv_context_create(int format, void *share, const int *attrib_lis
+     return TRUE;
+ }
+ 
++static void delete_bitmap_buffers(struct gl_drawable *gl)
++{
++    if (gl->base.draw_fbo) pglDeleteFramebuffersEXT(1, &gl->base.draw_fbo);
++    if (gl->color_buffer) pglDeleteRenderbuffersEXT(1, &gl->color_buffer);
++    if (gl->depth_buffer) pglDeleteRenderbuffersEXT(1, &gl->depth_buffer);
++    gl->base.draw_fbo = gl->base.read_fbo = 0;
++    gl->color_buffer = gl->depth_buffer = 0;
++}
++
++static BOOL create_bitmap_drawable(int format, GLsizei width, GLsizei height, struct opengl_drawable **drawable)
++{
++    CGLContextObj previous = CGLGetCurrentContext();
++    struct gl_drawable *gl;
++    GLenum status = 0;
++
++    if (!bitmap_context || width <= 0 || height <= 0 || width > bitmap_max_size || height > bitmap_max_size)
++        return FALSE;
++    if (!(gl = opengl_drawable_create(sizeof(*gl), &macdrv_pbuffer_funcs, format, NULL))) return FALSE;
++
++    pthread_mutex_lock(&bitmap_mutex);
++    if (CGLSetCurrentContext(bitmap_context) == kCGLNoError)
++    {
++        pglGenFramebuffersEXT(1, &gl->base.draw_fbo);
++        pglBindFramebufferEXT(GL_FRAMEBUFFER_EXT, gl->base.draw_fbo);
++        pglGenRenderbuffersEXT(1, &gl->color_buffer);
++        pglBindRenderbufferEXT(GL_RENDERBUFFER_EXT, gl->color_buffer);
++        pglRenderbufferStorageEXT(GL_RENDERBUFFER_EXT, GL_RGBA8, width, height);
++        pglFramebufferRenderbufferEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER_EXT, gl->color_buffer);
++        pglGenRenderbuffersEXT(1, &gl->depth_buffer);
++        pglBindRenderbufferEXT(GL_RENDERBUFFER_EXT, gl->depth_buffer);
++        pglRenderbufferStorageEXT(GL_RENDERBUFFER_EXT, GL_DEPTH24_STENCIL8_EXT, width, height);
++        pglFramebufferRenderbufferEXT(GL_FRAMEBUFFER_EXT, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER_EXT, gl->depth_buffer);
++        pglFramebufferRenderbufferEXT(GL_FRAMEBUFFER_EXT, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER_EXT, gl->depth_buffer);
++        funcs->p_glDrawBuffer(GL_COLOR_ATTACHMENT0);
++        funcs->p_glReadBuffer(GL_COLOR_ATTACHMENT0);
++        if (gl->base.draw_fbo && gl->color_buffer && gl->depth_buffer)
++            status = pglCheckFramebufferStatusEXT(GL_FRAMEBUFFER_EXT);
++        if (status != GL_FRAMEBUFFER_COMPLETE_EXT) delete_bitmap_buffers(gl);
++        pglBindFramebufferEXT(GL_FRAMEBUFFER_EXT, 0);
++        pglBindRenderbufferEXT(GL_RENDERBUFFER_EXT, 0);
++    }
++    CGLSetCurrentContext(previous);
++    pthread_mutex_unlock(&bitmap_mutex);
++
++    if (status != GL_FRAMEBUFFER_COMPLETE_EXT)
++    {
++        WARN("Failed to create bitmap framebuffer %dx%d, status %#x\n", width, height, status);
++        opengl_drawable_release(&gl->base);
++        return FALSE;
++    }
++
++    gl->base.read_fbo = gl->base.draw_fbo;
++    gl->base.virtual_size.cx = width;
++    gl->base.virtual_size.cy = height;
++    opengl_drawable_map_buffer(&gl->base, GL_FRONT_LEFT, GL_COLOR_ATTACHMENT0);
++    opengl_drawable_map_buffer(&gl->base, GL_FRONT, GL_COLOR_ATTACHMENT0);
++    opengl_drawable_map_buffer(&gl->base, GL_FRONT_AND_BACK, GL_COLOR_ATTACHMENT0);
++    *drawable = &gl->base;
++    TRACE("Created bitmap framebuffer %u, %dx%d, format %d\n", gl->base.draw_fbo, width, height, format);
++    return TRUE;
++}
++
+ static BOOL macdrv_pbuffer_create(HDC hdc, int format, BOOL largest, GLenum texture_format, GLenum texture_target,
+                                   GLint max_level, GLsizei *width, GLsizei *height, struct opengl_drawable **drawable)
+ {
+@@ -2192,6 +2323,14 @@ static BOOL macdrv_pbuffer_create(HDC hdc, int format, BOOL largest, GLenum text
+     TRACE("hdc %p, format %d, largest %u, texture_format %#x, texture_target %#x, max_level %#x, width %d, height %d, drawable %p\n",
+           hdc, format, largest, texture_format, texture_target, max_level, *width, *height, drawable);
+ 
++    if (pixel_formats[format - 1].bitmap)
++    {
++        /* Memory DCs use no texture attributes. Do not emulate the separate
++         * WGL render-to-texture / largest-pbuffer contracts here. */
++        if (largest || texture_format || texture_target || max_level) return FALSE;
++        return create_bitmap_drawable(format, *width, *height, drawable);
++    }
++
+     if (!texture_target || !texture_format)
+     {
+         /* no actual way to turn off ability to texture; use most permissive target */
+@@ -2220,7 +2359,15 @@ static void macdrv_pbuffer_destroy(struct opengl_drawable *base)
+ 
+     TRACE("drawable %s\n", debugstr_opengl_drawable(base));
+ 
+-    CGLReleasePBuffer(gl->pbuffer);
++    if (gl->base.draw_fbo)
++    {
++        CGLContextObj previous = CGLGetCurrentContext();
++        pthread_mutex_lock(&bitmap_mutex);
++        if (CGLSetCurrentContext(bitmap_context) == kCGLNoError) delete_bitmap_buffers(gl);
++        CGLSetCurrentContext(previous);
++        pthread_mutex_unlock(&bitmap_mutex);
++    }
++    if (gl->pbuffer) CGLReleasePBuffer(gl->pbuffer);
+ }
+ 
+ static BOOL macdrv_make_current(struct opengl_drawable *draw_base, struct opengl_drawable *read_base, void *private)
+@@ -2274,7 +2421,23 @@ static BOOL macdrv_make_current(struct opengl_drawable *draw_base, struct opengl
+     TRACE("making context current with draw_view %p draw_pbuffer %p read_view %p read_pbuffer %p format %u\n",
+           context->draw_view, context->draw_pbuffer, context->read_view, context->read_pbuffer, context->format);
+ 
+-    make_context_current(context, FALSE);
++    if (draw->base.draw_fbo || read->base.read_fbo)
++    {
++        if (CGLSetCurrentContext(context->cglcontext) != kCGLNoError) return FALSE;
++        /* win32u uploads the initial DIB before opengl32 restores its logical
++         * buffer state. Bind the physical bitmap framebuffer for that upload. */
++        pglBindFramebufferEXT(GL_DRAW_FRAMEBUFFER, draw->base.draw_fbo);
++        pglBindFramebufferEXT(GL_READ_FRAMEBUFFER, read->base.read_fbo);
++        funcs->p_glDrawBuffer(GL_COLOR_ATTACHMENT0);
++        funcs->p_glReadBuffer(GL_COLOR_ATTACHMENT0);
++        if (!context->bitmap_initialized)
++        {
++            funcs->p_glViewport(0, 0, draw->base.virtual_size.cx, draw->base.virtual_size.cy);
++            funcs->p_glScissor(0, 0, draw->base.virtual_size.cx, draw->base.virtual_size.cy);
++            context->bitmap_initialized = TRUE;
++        }
++    }
++    else make_context_current(context, FALSE);
+     NtCurrentTeb()->glReserved2 = context;
+ 
+     return TRUE;
+@@ -2499,6 +2662,12 @@ static BOOL macdrv_pbuffer_updated(HDC hdc, struct opengl_drawable *base, GLenum
+ 
+     TRACE("hdc %p drawable %s cube_face %#x mipmap_level %d\n", hdc, debugstr_opengl_drawable(base), cube_face, mipmap_level);
+ 
++    if (pixel_formats[base->format - 1].bitmap)
++    {
++        RtlSetLastWin32Error(ERROR_INVALID_OPERATION);
++        return GL_FALSE;
++    }
++
+     if (context && context->draw_pbuffer == pbuffer)
+     {
+         context->draw_pbuffer_face = cube_face;
+@@ -2587,6 +2756,18 @@ UINT macdrv_OpenGLInit(UINT version, const struct opengl_funcs *opengl_funcs, co
+     LOAD_FUNCPTR(glReadPixels);
+     LOAD_FUNCPTR(glCopyColorTable);
+ 
++#define LOAD_BITMAP_FUNCPTR(func) p##func = dlsym(opengl_handle, #func)
++    LOAD_BITMAP_FUNCPTR(glBindFramebufferEXT);
++    LOAD_BITMAP_FUNCPTR(glGenFramebuffersEXT);
++    LOAD_BITMAP_FUNCPTR(glDeleteFramebuffersEXT);
++    LOAD_BITMAP_FUNCPTR(glCheckFramebufferStatusEXT);
++    LOAD_BITMAP_FUNCPTR(glFramebufferRenderbufferEXT);
++    LOAD_BITMAP_FUNCPTR(glBindRenderbufferEXT);
++    LOAD_BITMAP_FUNCPTR(glGenRenderbuffersEXT);
++    LOAD_BITMAP_FUNCPTR(glDeleteRenderbuffersEXT);
++    LOAD_BITMAP_FUNCPTR(glRenderbufferStorageEXT);
++#undef LOAD_BITMAP_FUNCPTR
++
+     if (!init_gl_info())
+         goto failed;
+ 
+@@ -2614,6 +2795,7 @@ static BOOL macdrv_describe_pixel_format(int format, struct wgl_pixel_format *de
+ 
+     descr->pfd.dwFlags      = PFD_SUPPORT_OPENGL;
+     if (pf->window)         descr->pfd.dwFlags |= PFD_DRAW_TO_WINDOW;
++    if (pf->bitmap)         descr->pfd.dwFlags |= PFD_DRAW_TO_BITMAP | PFD_SUPPORT_GDI;
+     if (!pf->accelerated)   descr->pfd.dwFlags |= PFD_GENERIC_FORMAT;
+     else                    descr->pfd.dwFlags |= PFD_SUPPORT_COMPOSITION;
+     if (pf->double_buffer)  descr->pfd.dwFlags |= PFD_DOUBLEBUFFER;
+diff --git a/dlls/win32u/opengl.c b/dlls/win32u/opengl.c
+index 0e06f07..2c3a7a1 100644
+--- a/dlls/win32u/opengl.c
++++ b/dlls/win32u/opengl.c
+@@ -1729,6 +1729,47 @@ static BOOL create_memory_pbuffer( HDC hdc )
+     return ret;
+ }
+ 
++static BOOL sync_bitmap_framebuffer( const struct opengl_funcs *funcs, BITMAPINFO *info,
++                                     void *bits, BOOL write )
++{
++    int width = info->bmiHeader.biWidth, height = abs( info->bmiHeader.biHeight );
++    BITMAPINFO buffer_info = {.bmiHeader = {sizeof(BITMAPINFOHEADER), width, height, 1, 32, BI_RGB}};
++    struct bitblt_coords src = {.width = width, .height = height, .visrect = {0, 0, width, height}};
++    SIZE_T size = (SIZE_T)width * height * 4;
++    void *buffer;
++    BOOL ret;
++
++    /* GL_BGRA is four bytes per pixel, but a memory DC may contain 24-bit,
++     * padded, or top-down pixels. Never read/write that memory as packed BGRA.
++     * GDI's existing converter handles the format and row orientation. */
++    if (width <= 0 || height <= 0 || size > INT_MAX || !(buffer = malloc( size ))) return FALSE;
++    ret = !write || !convert_bitmapinfo( info, bits, &src, &buffer_info, buffer );
++    if (ret)
++    {
++        GLenum alignment = write ? GL_UNPACK_ALIGNMENT : GL_PACK_ALIGNMENT;
++        GLenum row_length = write ? GL_UNPACK_ROW_LENGTH : GL_PACK_ROW_LENGTH;
++        GLenum skip_rows = write ? GL_UNPACK_SKIP_ROWS : GL_PACK_SKIP_ROWS;
++        GLenum skip_pixels = write ? GL_UNPACK_SKIP_PIXELS : GL_PACK_SKIP_PIXELS;
++
++        funcs->p_glPushClientAttrib( GL_CLIENT_PIXEL_STORE_BIT );
++        funcs->p_glPixelStorei( alignment, 4 );
++        funcs->p_glPixelStorei( row_length, 0 );
++        funcs->p_glPixelStorei( skip_rows, 0 );
++        funcs->p_glPixelStorei( skip_pixels, 0 );
++        if (funcs->p_glBindBuffer)
++            funcs->p_glBindBuffer( write ? GL_PIXEL_UNPACK_BUFFER : GL_PIXEL_PACK_BUFFER, 0 );
++        if (write) funcs->p_glDrawPixels( width, height, GL_BGRA, GL_UNSIGNED_BYTE, buffer );
++        else
++        {
++            funcs->p_glReadPixels( 0, 0, width, height, GL_BGRA, GL_UNSIGNED_BYTE, buffer );
++            ret = !convert_bitmapinfo( &buffer_info, buffer, &src, info, bits );
++        }
++        funcs->p_glPopClientAttrib();
++    }
++    free( buffer );
++    return ret;
++}
++
+ static BOOL flush_memory_dc( struct opengl_context *context, HDC hdc, BOOL write, void (*flush)(void) )
+ {
+     const struct opengl_funcs *funcs = &display_funcs;
+@@ -1749,9 +1790,14 @@ static BOOL flush_memory_dc( struct opengl_context *context, HDC hdc, BOOL write
+ 
+         if (!get_image_from_bitmap( bmp, info, &bits, &src ))
+         {
+-            int width = info->bmiHeader.biWidth, height = info->bmiHeader.biSizeImage / 4 / width;
+-            if (write) funcs->p_glDrawPixels( width, height, GL_BGRA, GL_UNSIGNED_BYTE, bits.ptr );
+-            else funcs->p_glReadPixels( 0, 0, width, height, GL_BGRA, GL_UNSIGNED_BYTE, bits.ptr );
++            if (context->draw->draw_fbo)
++                ret = sync_bitmap_framebuffer( funcs, info, bits.ptr, write );
++            else
++            {
++                int width = info->bmiHeader.biWidth, height = info->bmiHeader.biSizeImage / 4 / width;
++                if (write) funcs->p_glDrawPixels( width, height, GL_BGRA, GL_UNSIGNED_BYTE, bits.ptr );
++                else funcs->p_glReadPixels( 0, 0, width, height, GL_BGRA, GL_UNSIGNED_BYTE, bits.ptr );
++            }
+         }
+         GDI_ReleaseObj( dc->hBitmap );
+     }

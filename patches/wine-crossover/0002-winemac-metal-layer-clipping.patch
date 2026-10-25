@@ -1,0 +1,190 @@
+diff --git a/dlls/winemac.drv/cocoa_window.m b/dlls/winemac.drv/cocoa_window.m
+index 8ca5dd7..d543665 100644
+--- a/dlls/winemac.drv/cocoa_window.m
++++ b/dlls/winemac.drv/cocoa_window.m
+@@ -3872,6 +3872,52 @@ void macdrv_set_view_frame(macdrv_view v, CGRect rect)
+ }
+ }
+
++/***********************************************************************
++ *              macdrv_set_view_clip
++ *
++ * Clips a client surface view to an array of rectangles.  If rects is
++ * NULL, resets the view's clip to its bounds.
++ */
++void macdrv_set_view_clip(macdrv_view v, const CGRect *rects, int count)
++{
++@autoreleasepool
++{
++    WineContentView* view = (WineContentView*)v;
++    OnMainThread(^{
++        CALayer* layer = [view layer];
++        CAShapeLayer* mask = (CAShapeLayer*)[layer mask];
++        CGMutablePathRef path = NULL;
++        BOOL hidden = rects && !count;
++        unsigned int i;
++
++        if (rects)
++        {
++            path = CGPathCreateMutable();
++            for (i = 0; i < count; i++)
++            {
++                CGRect rect = cgrect_mac_from_win(rects[i]);
++                CGPathAddRect(path, NULL, rect);
++            }
++        }
++
++        [CATransaction begin];
++        [CATransaction setDisableActions:YES];
++        if (path)
++        {
++            if (!mask) [layer setMask:mask = [CAShapeLayer layer]];
++            [mask setContentsScale:[layer contentsScale]];
++            [mask setFrame:[layer bounds]];
++            if (!CGPathEqualToPath(path, [mask path])) [mask setPath:path];
++        }
++        else if (mask) [layer setMask:nil];
++        [view setHidden:hidden];
++        [CATransaction commit];
++        [(WineWindow*)view.window updateForGLSubviews];
++        if (path) CGPathRelease(path);
++    });
++}
++}
++
+ /***********************************************************************
+  *              macdrv_set_view_superview
+  *
+diff --git a/dlls/winemac.drv/macdrv.h b/dlls/winemac.drv/macdrv.h
+index aeeadae..6f5baf9 100644
+--- a/dlls/winemac.drv/macdrv.h
++++ b/dlls/winemac.drv/macdrv.h
+@@ -199,6 +199,11 @@ extern BOOL macdrv_SystemParametersInfo(UINT action, UINT int_param, void *ptr_p
+     struct client_surface   client;
+     macdrv_view             cocoa_view;
+     macdrv_metal_swapchain  metal_swapchain;
++    HRGN                    clip_region;
++    RECT                    clip_rect;
++    BOOL                    clip_region_valid;
++    BOOL                    clip_rect_valid;
++    BOOL                    clip_present_replayed;
+ };
+
+ extern struct macdrv_client_surface *impl_from_client_surface(struct client_surface *client);
+diff --git a/dlls/winemac.drv/macdrv_cocoa.h b/dlls/winemac.drv/macdrv_cocoa.h
+index 9a91edb..c96a1d3 100644
+--- a/dlls/winemac.drv/macdrv_cocoa.h
++++ b/dlls/winemac.drv/macdrv_cocoa.h
+@@ -519,6 +519,7 @@ extern void macdrv_order_cocoa_window(macdrv_window w, macdrv_window prev,
+ extern macdrv_view macdrv_create_view(CGRect rect);
+ extern void macdrv_dispose_view(macdrv_view v);
+ extern void macdrv_set_view_frame(macdrv_view v, CGRect rect);
++extern void macdrv_set_view_clip(macdrv_view v, const CGRect *rects, int count);
+ extern void macdrv_set_view_superview(macdrv_view v, macdrv_view s, macdrv_window w, macdrv_view p, macdrv_view n);
+ extern void macdrv_set_view_hidden(macdrv_view v, bool hidden);
+ extern void macdrv_add_view_opengl_context(macdrv_view v, macdrv_opengl_context c);
+diff --git a/dlls/winemac.drv/window.c b/dlls/winemac.drv/window.c
+index c23142d..634bdf0 100644
+--- a/dlls/winemac.drv/window.c
++++ b/dlls/winemac.drv/window.c
+@@ -1077,6 +1077,7 @@ static void macdrv_client_surface_destroy(struct client_surface *client)
+     TRACE("%s\n", debugstr_client_surface(client));
+
+     if (surface->metal_swapchain) macdrv_destroy_swapchain(surface->metal_swapchain);
++    if (surface->clip_region) NtGdiDeleteObjectApp(surface->clip_region);
+ }
+
+ static void macdrv_client_surface_detach(struct client_surface *client)
+@@ -1100,18 +1101,63 @@ static void macdrv_client_surface_detach(struct client_surface *client)
+     }
+ }
+
++static void macdrv_client_surface_update_clip(struct macdrv_client_surface *surface, HDC hdc)
++{
++    struct client_surface *client = &surface->client;
++    HRGN clip_region;
++    RGNDATA *clip_data;
++
++    if (!surface->clip_region || !hdc) return;
++    if ((clip_region = NtGdiCreateRectRgn(0, 0, 0, 0)))
++    {
++        if (NtGdiGetRandomRgn(hdc, clip_region, SYSRGN | NTGDI_RGN_MONITOR_DPI) <= 0)
++        {
++            if (surface->clip_region_valid)
++            {
++                macdrv_set_view_clip(surface->cocoa_view, NULL, 0);
++                surface->clip_region_valid = FALSE;
++                surface->clip_rect_valid = FALSE;
++            }
++        }
++        else
++        {
++            if ((!surface->clip_region_valid || !NtGdiEqualRgn(clip_region, surface->clip_region) ||
++                 !surface->clip_rect_valid || !EqualRect(&client->monitor_rect, &surface->clip_rect)) &&
++                (clip_data = get_region_data(clip_region, 0)))
++            {
++                macdrv_set_view_clip(surface->cocoa_view, (CGRect *)clip_data->Buffer, clip_data->rdh.nCount);
++                NtGdiCombineRgn(surface->clip_region, clip_region, 0, RGN_COPY);
++                surface->clip_rect = client->monitor_rect;
++                surface->clip_region_valid = TRUE;
++                surface->clip_rect_valid = TRUE;
++                free(clip_data);
++            }
++        }
++        NtGdiDeleteObjectApp(clip_region);
++    }
++}
++
+ static void macdrv_client_surface_update(struct client_surface *client)
+ {
+     struct macdrv_client_surface *surface = impl_from_client_surface(client);
+-    HWND hwnd = client->hwnd, toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
++    HWND hwnd = client->hwnd, toplevel = client->toplevel;
+     struct macdrv_win_data *data;
++    BOOL offscreen;
++    HDC hdc;
+
+     TRACE("%s\n", debugstr_client_surface(client));
+
++    offscreen = NtUserGetAncestor(hwnd, GA_PARENT) != NtUserGetDesktopWindow();
++    InterlockedExchange(&client->offscreen, offscreen);
+     if (!(data = get_win_data(toplevel))) return;
+     macdrv_set_view_frame(surface->cocoa_view, cgrect_from_rect(client->monitor_rect));
+     macdrv_set_view_superview(surface->cocoa_view, toplevel == hwnd ? NULL : data->client_view, data->cocoa_window, NULL, NULL);
+     release_win_data(data);
++    if (offscreen && (hdc = NtUserGetDCEx(hwnd, 0, DCX_CACHE | DCX_USESTYLE)))
++    {
++        macdrv_client_surface_update_clip(surface, hdc);
++        NtUserReleaseDC(hwnd, hdc);
++    }
+ }
+
+ static void macdrv_client_surface_present(struct client_surface *client, HDC hdc)
+@@ -1129,6 +1175,19 @@ static void macdrv_client_surface_present(struct client_surface *client, HDC hdc)
+         data->client_view = surface->cocoa_view;
+     }
+     release_win_data(data);
++    /* The initial layer mask may not take effect on the first OpenGL present.
++     * Replay the cached region once without sampling a possibly stale SYSRGN. */
++    if (hdc && !surface->clip_present_replayed)
++    {
++        RGNDATA *clip_data;
++
++        if (surface->clip_region_valid && (clip_data = get_region_data(surface->clip_region, 0)))
++        {
++            surface->clip_present_replayed = TRUE;
++            macdrv_set_view_clip(surface->cocoa_view, (CGRect *)clip_data->Buffer, clip_data->rdh.nCount);
++            free(clip_data);
++        }
++    }
+ }
+
+ static const struct client_surface_funcs macdrv_client_surface_funcs =
+@@ -1151,6 +1210,7 @@ struct macdrv_client_surface *impl_from_client_surface(struct client_surface *client)
+
+     surface = client_surface_create(sizeof(*surface), &macdrv_client_surface_funcs, hwnd, pixel_format);
+     surface->cocoa_view = macdrv_create_view(cgrect_from_rect(surface->client.monitor_rect));
++    surface->clip_region = NtGdiCreateRectRgn(0, 0, 0, 0);
+     macdrv_set_view_hidden(surface->cocoa_view, TRUE);
+
+     if (surface)

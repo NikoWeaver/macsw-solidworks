@@ -1,0 +1,88 @@
+From: MacSW maintainers
+Subject: [PATCH] server: Never walk a parent's unlinked window list as its Z-order list.
+
+win32u destroy_window() unlinks a window (set_parent with parent 0) before
+it sends WM_NCDESTROY and frees the handle. In that time the handle is
+still valid, but the window is on its parent's unlinked list, not on the
+children (Z-order) list. A new window is on the same list until it is first
+linked. get_next_window() stops only at the children list head, so a walk
+that starts at an unlinked window never ends: at the end of the unlinked
+list it takes the list head for a window and goes round again. wineserver
+has one thread, so every process of the prefix then waits.
+
+Three requests can start such a walk:
+ * get_class_windows with a child (FindWindowEx(parent, child_after, ...))
+   while another thread destroys child_after. A test sampler's loop
+   while ((h = FindWindowExW(NULL, h, L"#32770", NULL))) that ran while
+   SOLIDWORKS closed a dialog froze the bottle: wineserver at 100 % CPU in
+   req_get_class_windows (3 hangs in about 45 Save As runs).
+ * get_window_list, siblings from a window: list_window_children() reads
+   the first child with one request and lists from it with a second one;
+   the child can be unlinked in between.
+ * set_window_pos with an unlinked insert-after window: link_window() puts
+   the window after it, that is on the unlinked list with is_linked set.
+
+Changes in server/window.c:
+ * get_class_windows: no window comes after an unlinked child (empty
+   result, as for a child of another parent).
+ * get_window_list: an unlinked start window lists from the parent's first
+   child (the current siblings).
+ * set_window_pos: an unlinked insert-after window keeps the current Z
+   order (SWP_NOZORDER).
+ * get_next_window()/get_prev_window(): stop at the unlinked list head, so
+   no walk can go round that list (defensive).
+Upstream Wine (master, 2026-10) has the same code without these checks.
+Details: docs/native-file-dialogs.md, Open issues.
+
+diff --git a/server/window.c b/server/window.c
+index 385156a..1fc054a 100644
+--- a/server/window.c
++++ b/server/window.c
+@@ -192,6 +192,9 @@ static int is_orphan_window( struct window *win )
+ static inline struct window *get_next_window( struct window *win )
+ {
+     struct list *ptr = list_next( &win->parent->children, &win->entry );
++    /* MacSW: a window that is not linked is on the parent's unlinked list, which never
++     * reaches the children list head; stop at the unlinked list head instead */
++    if (ptr == &win->parent->unlinked) return NULL;
+     return ptr ? LIST_ENTRY( ptr, struct window, entry ) : NULL;
+ }
+ 
+@@ -199,6 +202,7 @@ static inline struct window *get_next_window( struct window *win )
+ static inline struct window *get_prev_window( struct window *win )
+ {
+     struct list *ptr = list_prev( &win->parent->children, &win->entry );
++    if (ptr == &win->parent->unlinked) return NULL;  /* MacSW: see get_next_window() */
+     return ptr ? LIST_ENTRY( ptr, struct window, entry ) : NULL;
+ }
+ 
+@@ -976,6 +980,9 @@ static void get_window_list( struct desktop *desktop, struct window *win, struct
+     }
+     else if (!is_desktop_window( win ))  /* siblings starting from specified window */
+     {
++        /* MacSW: the start window (usually the first child, read with an earlier request)
++         * may have been unlinked since by DestroyWindow; list the current siblings */
++        if (!win->is_linked) win = get_first_child( win->parent );
+         for (child = win; child; child = get_next_window( child ))
+             append_window_to_list( child, thread, 0, handles, count, max_count );
+     }
+@@ -2600,6 +2607,9 @@ DECL_HANDLER(get_class_windows)
+         if (!parent) parent = get_desktop_window( current );
+         if (!(win = get_window( req->child ))) return;
+         if (win->parent != parent) return;
++        /* MacSW: an unlinked child (being created, or unlinked by DestroyWindow before
++         * WM_NCDESTROY) has no place in the Z-order list: no window comes after it */
++        if (!win->is_linked) return;
+         if (!(win = get_next_window( win ))) return;
+     }
+     else if (parent && !(win = get_first_child( parent ))) return;
+@@ -2727,6 +2737,9 @@ DECL_HANDLER(set_window_pos)
+                 set_error( STATUS_INVALID_PARAMETER );
+                 return;
+             }
++            /* MacSW: linking after an unlinked window would put win on the parent's
++             * unlinked list with is_linked set; keep the current Z order instead */
++            if (!previous->is_linked) flags |= SWP_NOZORDER;
+             break;
+         }
+         if (previous == win) flags |= SWP_NOZORDER;  /* nothing to do */

@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "team": "Robotics team",
+  "solidworks": { "release": "2026 SP4.1", "build": "34.4.1.1011" },
+  "media": {
+    "path": "media/SOLIDWORKS 2026 SP04.1",
+    "manifestSHA256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "vba": { "path": "media/SOLIDWORKS 2026 SP04.1/PreReqs/VBA" },
+  "defaults": {
+    "language": "en",
+    "toolbox": false,
+    "driveLetters": true,
+    "macFileDialogs": "all",
+    "launchSolidWorksAtStart": false
+  },
+  "install": { "showOtherKeys": false, "showLicenseServer": false },
+  "updates": { "feed": "releases/latest.json" },
+  "support": { "contact": "Ask in the team CAD channel", "guide": "Start here.pdf" }
+}

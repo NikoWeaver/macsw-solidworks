@@ -1,0 +1,106 @@
+MacSW @RELEASE@ for SOLIDWORKS 2026 SP4.1
+Read this before you open MacSW.
+
+MacSW installs and runs the Windows version of SOLIDWORKS 2026 on an Apple Silicon Mac. It is
+based on MacSW by YJBeetle. It is not an official MacSW release, and it is not made or supported
+by Dassault Systemes.
+
+
+INSTALL
+-------
+
+1. Get the app. Open the team's Box folder MacSW/releases. Copy @DMG@ to Downloads.
+2. Install it. Open the DMG. Drag MacSW onto Applications.
+3. Open it. Double-click MacSW in Applications. The first time only, macOS blocks it.
+   Do the steps in "FIRST OPEN" below.
+4. Confirm the media. MacSW checks the Mac. Click Continue. MacSW then looks for the team config
+   and the SOLIDWORKS media in Downloads and in Box. macOS asks whether MacSW may open these
+   folders: click Allow. MacSW shows "SOLIDWORKS 2026 SP4.1, found in your Box team folder".
+5. Enter the access key. Type or paste the team serial once. Click Install. Leave the Mac on
+   charge. MacSW copies the media, installs everything and shows each step.
+6. Done. On the last page, click Install SOLIDWORKS App, then Done.
+7. Activate. Start SOLIDWORKS (SOLIDWORKS.app, or Launch SOLIDWORKS in the MacSW menu). In the
+   SOLIDWORKS Activation Wizard, click Activate now > Automatically over the internet > your
+   e-mail > Finish. Activate once.
+
+Time: about 30 to 90 minutes, mostly waiting. Copying 9 to 20 GB from Box takes 10 minutes to an
+hour. The first SOLIDWORKS start is slow once (Rosetta translates the code). Later starts take
+about 30 seconds.
+
+
+FIRST OPEN (step 3)
+-------------------
+
+MacSW is signed with the team's own certificate, not with an Apple Developer ID. So the first time,
+macOS says "Apple could not verify MacSW is free of malware". On macOS 15 and later,
+Control-click > Open no longer gets past this message. Do this:
+
+1. Click Done. Do not click Move to Trash.
+2. Open System Settings > Privacy & Security.
+3. Scroll down to the message about MacSW. Click Open Anyway.
+4. Enter your Mac password. Then click Open.
+
+MacSW then asks one question:
+
+   "MacSW will remove the download flag from its own files so that macOS does not block its
+   Wine helpers."
+
+Click Remove Download Flag. MacSW changes nothing else.
+
+The Terminal fast path (optional). Instead of steps 2 and 3 of INSTALL, paste this line into
+Terminal and press Return:
+
+   bash "/Volumes/@VOLUME@/install-helper.sh"
+
+The script prints each step before it runs it. It checks the signature of MacSW on this disk
+image. Then it asks before it changes anything. On "y" it copies MacSW to /Applications (an old
+copy goes to the Trash), removes the macOS download flag from /Applications/MacSW.app only and
+opens MacSW. It uses no sudo and changes no setting.
+
+
+WHAT ELSE CAN COME UP
+---------------------
+
+- No Rosetta: macOS asks to install Rosetta, or MacSW says it is missing. Click Install. If no
+  dialog appears, run this in Terminal: softwareupdate --install-rosetta
+- Box Drive: Box downloads the media on first read, and can say the folder is "online only".
+  Wait. Or first right-click the folder > Make Available Offline.
+- Privacy prompts: "MacSW would like to access files in your Desktop folder" (and Documents,
+  Downloads). Click Allow three times.
+- Box and iCloud: a prompt for the Box or iCloud folder, the first time SOLIDWORKS should see it.
+  Click Allow.
+- Activation: in the wizard, click Activate now > Automatically over the internet > your e-mail >
+  Finish. If the wizard does not open, use Help > Licenses > Activate in SOLIDWORKS. A
+  "SOLIDWORKS License Agreement" window can also appear at the first start. Read it and answer
+  it yourself.
+- "No activations left" or a similar message: stop. Tell the admin. Do not retry. Each try can
+  use an activation.
+
+
+AFTER DAY ONE
+-------------
+
+- Open files by double-clicking them in Finder, or from File > Open in SOLIDWORKS.
+- When the admin publishes a new build, install it like this one. MacSW does not check for
+  updates by itself yet.
+- If something breaks: MacSW menu > Export Diagnostics. Send the zip to the admin.
+- Before you wipe the Mac, sell it or leave the team: in SOLIDWORKS, click Help > Licenses >
+  Deactivate.
+- Do not upgrade to macOS 28.
+- Never put the access key in a chat, an issue, a screenshot or a file you share.
+
+
+CHECK THE DOWNLOAD (optional)
+-----------------------------
+
+SHA256SUMS is next to the DMG in the team folder. In Terminal, go to the folder that holds both
+files and run: shasum -a 256 -c SHA256SUMS
+The line for @DMG@ must say OK.
+
+
+LICENSES
+--------
+
+The Licenses folder has the licence and notice files of MacSW, Wine, Wine-Mono and the other
+parts in MacSW.app, as the build made them. SOURCE.txt says where to get the exact sources of
+this build.

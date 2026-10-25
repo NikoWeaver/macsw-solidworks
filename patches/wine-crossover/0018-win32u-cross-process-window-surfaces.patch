@@ -1,0 +1,397 @@
+From: MacSW maintainers
+Subject: [PATCH] win32u: Draw child windows of another process's top-level window through a shared surface.
+
+A DC gets a window surface only when its top-level window belongs to the
+current process. Microsoft Edge WebView2 (Chromium) draws its child windows
+from the browser process while the top-level window belongs to the host
+application, so on the Mac driver every frame is lost and the host window
+stays empty (WineHQ bug 35456). winex11 hides this with X11DRV_GetDC; winemac
+has no equivalent.
+
+When MACSW_CROSS_PROCESS_SURFACES=1 is set, draw such client-area DCs into a
+DIB in a named shared section and post the internal message
+WM_WINE_FOREIGN_SURFACE to the top-level window on flush. The thread that owns
+the top-level window maps the section and copies it into its own window
+surface through a normal clipped DC. Without the variable nothing changes:
+neither side acts, and WM_WINE_FOREIGN_SURFACE is ignored.
+
+The receiver treats the shared header as untrusted (any process of the prefix
+can write it): it reads magic, width and height once into locals, accepts at
+most 16384 x 16384 like the sender, and checks that width * height * 4 bytes
+fit in the mapped view without an overflowing multiplication.
+
+Debug channel: +xsurface.
+
+diff --git a/dlls/win32u/dce.c b/dlls/win32u/dce.c
+index e3eca0f..1945285 100644
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -33,6 +33,7 @@
+ #include "wine/debug.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(win);
++WINE_DECLARE_DEBUG_CHANNEL(xsurface);
+ 
+ struct dce
+ {
+@@ -140,6 +141,273 @@ static void create_offscreen_window_surface( HWND hwnd, const RECT *surface_rect
+     if (previous) window_surface_release( previous );
+ }
+ 
++/*******************************************************************
++ * Cross-process window surface.
++ *
++ * A process that draws into a window whose top-level window belongs to
++ * another process has no access to that top-level window surface. The
++ * Mac and Wayland drivers have no way to draw into a window of another
++ * process, so drawing would be lost (WebView2/Chromium draws its child
++ * windows from the browser and GPU processes). Draw into a shared memory
++ * DIB instead, and ask the process that owns the top-level window to copy
++ * it into its own window surface.
++ */
++
++#define FOREIGN_SURFACE_MAGIC  0x53505846  /* "FXPS" */
++#define FOREIGN_SURFACE_OFFSET 0x10000     /* bits offset, keep allocation granularity alignment */
++#define FOREIGN_SURFACE_MAX_SIZE 16384     /* largest width and height, on both sides */
++
++struct foreign_surface_header
++{
++    UINT magic;
++    UINT width;
++    UINT height;
++    LONG pending;      /* a notification was posted and not yet consumed */
++    DWORD post_time;   /* tick count of the last notification */
++};
++
++struct foreign_surface
++{
++    struct window_surface header;
++    struct list entry;
++    HWND top;                               /* top-level window owned by the other process */
++    UINT id;
++    HANDLE section;
++    struct foreign_surface_header *shared;
++};
++
++static struct list foreign_surfaces = LIST_INIT( foreign_surfaces );
++static pthread_mutex_t foreign_surfaces_lock = PTHREAD_MUTEX_INITIALIZER;
++
++static BOOL foreign_surfaces_enabled(void)
++{
++    static int enabled = -1;
++    if (enabled == -1)
++    {
++        const char *env = getenv( "MACSW_CROSS_PROCESS_SURFACES" );
++        enabled = env && env[0] && env[0] != '0';
++    }
++    return enabled;
++}
++
++static void foreign_surface_name( WCHAR *buffer, UNICODE_STRING *str, DWORD pid, HWND hwnd, UINT id )
++{
++    char name[MAX_PATH];
++    snprintf( name, sizeof(name), "\\Sessions\\%u\\BaseNamedObjects\\__wine_foreign_surface_%x_%x_%x",
++              (int)RtlGetCurrentPeb()->SessionId, (int)pid, (int)HandleToUlong( hwnd ), id );
++    str->Buffer = buffer;
++    str->Length = asciiz_to_unicode( buffer, name ) - sizeof(WCHAR);
++    str->MaximumLength = str->Length + sizeof(WCHAR);
++}
++
++static struct foreign_surface *get_foreign_surface_ptr( struct window_surface *surface )
++{
++    return CONTAINING_RECORD( surface, struct foreign_surface, header );
++}
++
++static void foreign_surface_set_clip( struct window_surface *surface, const RECT *rects, UINT count )
++{
++}
++
++static BOOL foreign_surface_flush( struct window_surface *window_surface, const RECT *rect, const RECT *dirty,
++                                   const BITMAPINFO *color_info, const void *color_bits, BOOL shape_changed,
++                                   const BITMAPINFO *shape_info, const void *shape_bits )
++{
++    struct foreign_surface *surface = get_foreign_surface_ptr( window_surface );
++    DWORD now = NtGetTickCount();
++
++    /* coalesce notifications; resend if the owner did not answer for a while */
++    if (InterlockedExchange( &surface->shared->pending, 1 ) && (int)(now - surface->shared->post_time) < 500)
++        return TRUE;
++    surface->shared->post_time = now;
++    TRACE_(xsurface)( "hwnd %p top %p id %u dirty %s\n", window_surface->hwnd, surface->top, surface->id, wine_dbgstr_rect( dirty ) );
++    if (!NtUserPostMessage( surface->top, WM_WINE_FOREIGN_SURFACE, (WPARAM)window_surface->hwnd,
++                            ((LPARAM)GetCurrentProcessId() << 32) | surface->id ))
++        surface->shared->pending = 0;
++    return TRUE;
++}
++
++static void foreign_surface_destroy( struct window_surface *window_surface )
++{
++    struct foreign_surface *surface = get_foreign_surface_ptr( window_surface );
++    if (surface->shared) NtUnmapViewOfSection( GetCurrentProcess(), surface->shared );
++    if (surface->section) NtClose( surface->section );
++}
++
++static const struct window_surface_funcs foreign_surface_funcs =
++{
++    foreign_surface_set_clip,
++    foreign_surface_flush,
++    foreign_surface_destroy
++};
++
++/* returns a new reference to a shared surface for drawing the hwnd client area of size rect */
++static struct window_surface *get_foreign_surface( HWND hwnd, HWND top, const RECT *rect )
++{
++    static UINT next_id;
++    char buffer[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
++    BITMAPINFO *info = (BITMAPINFO *)buffer;
++    struct foreign_surface *surface, *next;
++    struct window_surface *window_surface = NULL;
++    UINT width = rect->right - rect->left, height = rect->bottom - rect->top;
++    WCHAR nameW[MAX_PATH];
++    UNICODE_STRING name;
++    OBJECT_ATTRIBUTES attr;
++    LARGE_INTEGER size;
++    SIZE_T view_size = 0;
++    HANDLE section = 0;
++    HBITMAP bitmap;
++    void *shared = NULL;
++    RECT surface_rect = {0, 0, width, height};
++    UINT id;
++
++    if (!width || !height || width > FOREIGN_SURFACE_MAX_SIZE || height > FOREIGN_SURFACE_MAX_SIZE) return NULL;
++
++    pthread_mutex_lock( &foreign_surfaces_lock );
++    LIST_FOR_EACH_ENTRY_SAFE( surface, next, &foreign_surfaces, struct foreign_surface, entry )
++    {
++        if (surface->header.hwnd != hwnd) continue;
++        if (surface->header.rect.right == width && surface->header.rect.bottom == height)
++        {
++            surface->top = top;
++            window_surface_add_ref( (window_surface = &surface->header) );
++            break;
++        }
++        list_remove( &surface->entry );
++        window_surface_release( &surface->header );
++    }
++    pthread_mutex_unlock( &foreign_surfaces_lock );
++    if (window_surface) return window_surface;
++
++    id = InterlockedIncrement( (LONG *)&next_id );
++    memset( info, 0, sizeof(*info) );
++    info->bmiHeader.biSize        = sizeof(info->bmiHeader);
++    info->bmiHeader.biWidth       = width;
++    info->bmiHeader.biHeight      = -height; /* top-down */
++    info->bmiHeader.biPlanes      = 1;
++    info->bmiHeader.biBitCount    = 32;
++    info->bmiHeader.biSizeImage   = get_dib_image_size( info );
++    info->bmiHeader.biCompression = BI_RGB;
++
++    foreign_surface_name( nameW, &name, GetCurrentProcessId(), hwnd, id );
++    InitializeObjectAttributes( &attr, &name, OBJ_CASE_INSENSITIVE | OBJ_OPENIF, NULL, NULL );
++    size.QuadPart = FOREIGN_SURFACE_OFFSET + info->bmiHeader.biSizeImage;
++    if (NtCreateSection( &section, SECTION_ALL_ACCESS, &attr, &size, PAGE_READWRITE, SEC_COMMIT, 0 ))
++    {
++        WARN_(xsurface)( "failed to create section %s\n", debugstr_us( &name ) );
++        return NULL;
++    }
++    view_size = sizeof(struct foreign_surface_header);
++    if (NtMapViewOfSection( section, GetCurrentProcess(), &shared, 0, 0, NULL, &view_size, ViewShare, 0, PAGE_READWRITE ))
++        goto failed;
++    if (!(bitmap = NtGdiCreateDIBSection( 0, section, FOREIGN_SURFACE_OFFSET, info, DIB_RGB_COLORS, 0, 0, 0, NULL )))
++        goto failed;
++    if (!(window_surface = window_surface_create( sizeof(*surface), &foreign_surface_funcs, hwnd, &surface_rect, info, bitmap )))
++    {
++        NtGdiDeleteObjectApp( bitmap );
++        goto failed;
++    }
++
++    surface = get_foreign_surface_ptr( window_surface );
++    surface->top = top;
++    surface->id = id;
++    surface->section = section;
++    surface->shared = shared;
++    surface->shared->width = width;
++    surface->shared->height = height;
++    surface->shared->magic = FOREIGN_SURFACE_MAGIC;
++
++    TRACE_(xsurface)( "created foreign surface %p for hwnd %p top %p size %ux%u id %u\n", surface, hwnd, top, width, height, id );
++
++    pthread_mutex_lock( &foreign_surfaces_lock );
++    window_surface_add_ref( window_surface );
++    list_add_tail( &foreign_surfaces, &surface->entry );
++    pthread_mutex_unlock( &foreign_surfaces_lock );
++    return window_surface;
++
++failed:
++    WARN_(xsurface)( "failed to create foreign surface for hwnd %p\n", hwnd );
++    if (shared) NtUnmapViewOfSection( GetCurrentProcess(), shared );
++    NtClose( section );
++    return NULL;
++}
++
++static void flush_foreign_surfaces(void)
++{
++    struct foreign_surface *surface;
++
++    if (list_empty( &foreign_surfaces )) return;
++    pthread_mutex_lock( &foreign_surfaces_lock );
++    LIST_FOR_EACH_ENTRY( surface, &foreign_surfaces, struct foreign_surface, entry )
++        window_surface_flush( &surface->header );
++    pthread_mutex_unlock( &foreign_surfaces_lock );
++}
++
++/* called in the process that owns the top-level window: copy the shared bits into our window surface */
++void update_foreign_surface( HWND hwnd, HWND child, LPARAM lparam )
++{
++    char buffer[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
++    BITMAPINFO *info = (BITMAPINFO *)buffer;
++    struct foreign_surface_header *header;
++    const volatile struct foreign_surface_header *shared;
++    WCHAR nameW[MAX_PATH];
++    UNICODE_STRING name;
++    OBJECT_ATTRIBUTES attr;
++    SIZE_T view_size = 0;
++    HANDLE section;
++    void *view = NULL;
++    UINT magic, width, height;
++    HDC hdc;
++
++    /* any process of the prefix can post the message: act only when cross-process surfaces are on */
++    if (!foreign_surfaces_enabled()) return;
++
++    foreign_surface_name( nameW, &name, lparam >> 32, child, (UINT)lparam );
++    InitializeObjectAttributes( &attr, &name, OBJ_CASE_INSENSITIVE, NULL, NULL );
++    if (NtOpenSection( &section, SECTION_MAP_READ | SECTION_MAP_WRITE, &attr ))
++    {
++        TRACE_(xsurface)( "no section %s\n", debugstr_us( &name ) );
++        return;
++    }
++    if (!NtMapViewOfSection( section, GetCurrentProcess(), &view, 0, 0, NULL, &view_size, ViewShare, 0, PAGE_READWRITE ))
++    {
++        header = view;
++        InterlockedExchange( &header->pending, 0 );
++        /* the other process can change the header at any time: read it once and only use the copies */
++        shared = header;
++        magic  = shared->magic;
++        width  = shared->width;
++        height = shared->height;
++        if (magic == FOREIGN_SURFACE_MAGIC && width && height &&
++            width <= FOREIGN_SURFACE_MAX_SIZE && height <= FOREIGN_SURFACE_MAX_SIZE &&
++            view_size > FOREIGN_SURFACE_OFFSET &&
++            (view_size - FOREIGN_SURFACE_OFFSET) / 4 / width >= height)  /* width * height * 4 bytes fit */
++        {
++            memset( info, 0, sizeof(*info) );
++            info->bmiHeader.biSize        = sizeof(info->bmiHeader);
++            info->bmiHeader.biWidth       = width;
++            info->bmiHeader.biHeight      = -(int)height;
++            info->bmiHeader.biPlanes      = 1;
++            info->bmiHeader.biBitCount    = 32;
++            info->bmiHeader.biCompression = BI_RGB;
++            info->bmiHeader.biSizeImage   = width * height * 4;
++
++            if ((hdc = NtUserGetDCEx( child, 0, DCX_CACHE | DCX_USESTYLE )))
++            {
++                NtGdiSetDIBitsToDeviceInternal( hdc, 0, 0, width, height, 0, 0, 0, height,
++                                                (char *)view + FOREIGN_SURFACE_OFFSET, info, DIB_RGB_COLORS,
++                                                info->bmiHeader.biSizeImage, sizeof(info->bmiHeader), FALSE, NULL );
++                NtUserReleaseDC( child, hdc );
++            }
++            TRACE_(xsurface)( "hwnd %p child %p %ux%u copied\n", hwnd, child, width, height );
++        }
++        else WARN_(xsurface)( "hwnd %p child %p: bad shared header %08x %ux%u, view size %#lx\n",
++                              hwnd, child, magic, width, height, (unsigned long)view_size );
++        NtUnmapViewOfSection( GetCurrentProcess(), view );
++    }
++    NtClose( section );
++}
++
+ struct scaled_surface
+ {
+     struct window_surface header;
+@@ -766,6 +1034,7 @@ void flush_window_surfaces( BOOL idle )
+         window_surface_flush( surface );
+ done:
+     pthread_mutex_unlock( &surfaces_lock );
++    flush_foreign_surfaces();
+ }
+ 
+ /***********************************************************************
+@@ -874,6 +1143,11 @@ static void update_visible_region( struct dce *dce )
+             if (surface) window_surface_add_ref( surface );
+             release_win_ptr( win );
+         }
++        else if (win == WND_OTHER_PROCESS && !(flags & DCX_WINDOW) && foreign_surfaces_enabled())
++        {
++            /* the top-level window belongs to another process, draw into a shared surface */
++            if ((surface = get_foreign_surface( dce->hwnd, top_win, &win_rect ))) top_rect = win_rect;
++        }
+     }
+ 
+     if (!surface) SetRectEmpty( &top_rect );
+@@ -1250,6 +1524,7 @@ static INT release_dc( HWND hwnd, HDC hdc, BOOL end_paint )
+     user_unlock();
+ 
+     release_opengl_drawables( &drawables );
++    flush_foreign_surfaces();
+     return ret;
+ }
+ 
+diff --git a/dlls/win32u/message.c b/dlls/win32u/message.c
+index 8c9a2aa..ed05577 100644
+--- a/dlls/win32u/message.c
++++ b/dlls/win32u/message.c
+@@ -2268,6 +2268,9 @@ static LRESULT handle_internal_message( HWND hwnd, UINT msg, WPARAM wparam, LPAR
+     case WM_WINE_SETPIXELFORMAT:
+         set_window_pixel_format( hwnd, wparam, lparam );
+         return 0;
++    case WM_WINE_FOREIGN_SURFACE:
++        update_foreign_surface( hwnd, (HWND)wparam, lparam );
++        return 0;
+     case WM_WINE_TRACKMOUSEEVENT:
+     {
+         TRACKMOUSEEVENT info;
+diff --git a/dlls/win32u/spy.c b/dlls/win32u/spy.c
+index c86d794..705692e 100644
+--- a/dlls/win32u/spy.c
++++ b/dlls/win32u/spy.c
+@@ -1127,7 +1127,7 @@ static const char * const CCMMessageTypeNames[SPY_MAX_CCMMSGNUM + 1] =
+     "CCM_SETNOTIFYWINDOW"
+ };
+ 
+-#define SPY_MAX_WINEMSGNUM   (WM_WINE_SETPIXELFORMAT - WM_WINE_DESTROYWINDOW)
++#define SPY_MAX_WINEMSGNUM   (WM_WINE_FOREIGN_SURFACE - WM_WINE_DESTROYWINDOW)
+ static const char * const WINEMessageTypeNames[SPY_MAX_WINEMSGNUM + 1] =
+ {
+     "WM_WINE_DESTROYWINDOW",
+@@ -1144,6 +1144,7 @@ static const char * const WINEMessageTypeNames[SPY_MAX_WINEMSGNUM + 1] =
+     "WM_WINE_UPDATEWINDOWSTATE",
+     "WM_WINE_TRACKMOUSEEVENT",
+     "WM_WINE_SETPIXELFORMAT",
++    "WM_WINE_FOREIGN_SURFACE",
+ };
+ 
+ #define SPY_MAX_WINE_DRIVER_MSGNUM (WM_WINE_SETCURSOR - WM_WINE_CLIPCURSOR)
+diff --git a/dlls/win32u/win32u_private.h b/dlls/win32u/win32u_private.h
+index c91aec8..b736bb5 100644
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -50,6 +50,7 @@ extern void create_window_surface( HWND hwnd, BOOL create_layered, const RECT *s
+ extern struct window_surface *get_driver_window_surface( struct window_surface *surface, struct ratio monitor_dpi );
+ extern void erase_now( HWND hwnd, UINT rdw_flags );
+ extern void flush_window_surfaces( BOOL idle );
++extern void update_foreign_surface( HWND hwnd, HWND child, LPARAM lparam );
+ extern void move_window_bits( HWND hwnd, const struct window_rects *rects, const RECT *valid_rects );
+ extern void move_window_bits_surface( HWND hwnd, const RECT *window_rect, struct window_surface *old_surface,
+                                       const RECT *old_visible_rect, const RECT *valid_rects );
+diff --git a/include/ntuser.h b/include/ntuser.h
+index be41b33..f048925 100644
+--- a/include/ntuser.h
++++ b/include/ntuser.h
+@@ -640,6 +640,7 @@ enum wine_internal_message
+     WM_WINE_UPDATEWINDOWSTATE,
+     WM_WINE_TRACKMOUSEEVENT,
+     WM_WINE_SETPIXELFORMAT,
++    WM_WINE_FOREIGN_SURFACE,
+     WM_WINE_FIRST_DRIVER_MSG = 0x80001000,  /* range of messages reserved for the USER driver */
+     WM_WINE_CLIPCURSOR = 0x80001ff0, /* internal driver notification messages */
+     WM_WINE_SETCURSOR,
