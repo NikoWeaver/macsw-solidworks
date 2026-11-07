@@ -11,8 +11,8 @@ sharing plan.
 | Key | Example | Used for |
 |---|---|---|
 | `APP_VERSION` | `0.2.0` | `CFBundleShortVersionString`. Numbers only. |
-| `APP_BUILD` | `6` | `CFBundleVersion`. It only goes up, also between release candidates. |
-| `APP_RELEASE` | `0.2.0-rc.2` | File names, git tags and `AppRelease` in `BuildManifest.plist`. |
+| `APP_BUILD` | `7` | `CFBundleVersion`. It only goes up, also between release candidates. |
+| `APP_RELEASE` | `0.2.0` | File names, git tags and `AppRelease` in `BuildManifest.plist`. |
 
 `APP_RELEASE` is `APP_VERSION` for a release, or `APP_VERSION-rc.N` for a release candidate.
 `scripts/lib/config.sh` refuses any other value. The three keys do not change the cache identity
@@ -77,8 +77,8 @@ The file list has names only. `--home-paths` reads the bytes of every file and z
 module keeps the folder it was built in (debug information). `scripts/build_winemac.sh` maps
 the checkout to `/macsw` (`-ffile-prefix-map`). The 0.2.0-rc.1 build was made before that
 change: its 15 rebuilt Wine modules hold the build folder, so that image fails this check.
-The file list scan fails while the app holds `Resources/managed/stdole.dll`: its licence
-terms allow no distribution (`docs/licences-and-notices.md`, open items).
+The file list scan allows `Resources/managed/stdole.dll` only when it is the clean-room build
+of `third_party/stdole-clean` (by SHA-256; `docs/licences-and-notices.md`, stdole.dll).
 
 ## The install helper
 

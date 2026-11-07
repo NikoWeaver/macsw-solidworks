@@ -60,27 +60,12 @@ fetch_mono_patch() {
         "${mono_dir}/regasm-x86_64.exe" "${MONO_REGASM_X64_SHA256}"
 }
 
+# The clean-room stdole is in the repository (third_party/stdole-clean); nothing is downloaded.
 fetch_stdole() {
-    local archive="${DIST_DIR}/${STDOLE_PACKAGE_ASSET}"
-    local output_dir="${DIST_DIR}/${STDOLE_OUTPUT_DIRECTORY}"
-    local output="${output_dir}/stdole.dll"
     local actual_sha256
-    download_verified "Microsoft stdole ${STDOLE_VERSION}" "${STDOLE_PACKAGE_URL}" \
-        "${archive}" "${STDOLE_PACKAGE_SHA256}"
-    mkdir -p "${output_dir}"
-    if [ ! -f "${output}" ]; then
-        unzip -p "${archive}" "${STDOLE_PACKAGE_MEMBER}" > "${output}.download"
-        actual_sha256="$(shasum -a 256 "${output}.download" | awk '{print $1}')"
-        if [ "${actual_sha256}" != "${STDOLE_DLL_SHA256}" ]; then
-            echo "Microsoft stdole DLL checksum mismatch" >&2
-            rm -f -- "${output}.download"
-            exit 1
-        fi
-        mv "${output}.download" "${output}"
-    fi
-    actual_sha256="$(shasum -a 256 "${output}" | awk '{print $1}')"
+    actual_sha256="$(shasum -a 256 "${STDOLE_DLL_SOURCE}" | awk '{print $1}')"
     if [ "${actual_sha256}" != "${STDOLE_DLL_SHA256}" ]; then
-        echo "Microsoft stdole DLL checksum mismatch: ${output}" >&2
+        echo "stdole DLL checksum mismatch: ${STDOLE_DLL_SOURCE}" >&2
         exit 1
     fi
 }

@@ -108,6 +108,25 @@ staged with `MACSW_SOURCE_URL=` (an empty value). Then `SOURCE.txt` names no
 repository, and the source archive in the Box `releases/` folder is the way to
 get the source.
 
+## stdole.dll
+
+`Resources/managed/stdole.dll` is MacSW's own clean-room build, from
+`third_party/stdole-clean` (LGPL-2.1-or-later; its `README.md` says how it was
+built and tested). It declares the OLE Automation types in C#, following Wine's
+`stdole2.idl` and `olectl.h`, and has no strong name. It holds nothing from
+Microsoft's file.
+
+Up to 0.2.0-rc.2, MacSW shipped Microsoft's `stdole.dll` from the NuGet package
+stdole 7.0.3300. That package gives only the licence address
+`http://go.microsoft.com/fwlink/?LinkID=746386`; read on 2026-10-25, it leads to
+Microsoft's pre-release licence terms for Visual Studio 2017
+(`VS2017_PREVIEW_ENG_EULA.1033.docx`, SHA-256
+`b4371519045facdffd7d556fc7459c7a8b819ba593d9f346478d28cda3f373e7`), which allow
+evaluation use only and no distribution. So 0.2.0 replaces the file, and the
+build no longer downloads the NuGet package. The publication scan allows a
+`stdole.dll` only with the SHA-256 of the clean-room build
+(`STDOLE_DLL_SHA256`); any other `stdole.dll` is a proprietary-file hit.
+
 ## Open items
 
 - **The fork's repository.** `https://github.com/NikoWeaver/macsw-solidworks`,
@@ -115,33 +134,6 @@ get the source.
   a clone of it (see above). A member who
   cannot open the repository uses the copy in the Box `releases/` folder, so
   that copy must be there for every release.
-- **stdole.dll: the terms do not allow MacSW to ship it.** Every MacSW.app and
-  DMG holds `Resources/managed/stdole.dll` from the NuGet package stdole
-  7.0.3300 (Microsoft). The package gives only a licence address,
-  `http://go.microsoft.com/fwlink/?LinkID=746386` (in `stdole.nuspec`).
-  Read on 2026-10-25: that address leads to
-  `https://visualstudio.microsoft.com/license-terms/mt591984/`, which shows the
-  document `VS2017_PREVIEW_ENG_EULA.1033.docx` (SHA-256
-  `b4371519045facdffd7d556fc7459c7a8b819ba593d9f346478d28cda3f373e7`): "Microsoft
-  Pre-Release Software License Terms, Microsoft Visual Studio 2017 Family
-  Pre-Release Software" (EULAID `VS2017_CTP_EVAL_VS_ENU.3`). These terms allow
-  installation and use for evaluation only, allow no distribution of an
-  application made with the software, and forbid sharing, publishing or
-  transferring the software. They have no part for distributable code. So
-  these terms give no right to give the file to team members or to publish
-  it. Giving the app to team members is distribution (see the top of this
-  page), so this blocks the Box team DMG as well as a DMG on a GitHub Release.
-  The source tree is not affected: `make fetch-stdole` downloads the file at
-  build time. The publication scan now fails a file list that holds
-  `stdole.dll` (proprietary-file).
-  Next step (a decision for the owner, then a licence test): stop putting the
-  file in the bundle, and let MacSW get it on the member's Mac at install time.
-  Either take it from the member's SOLIDWORKS media, if the media has it (this
-  is not checked yet), or download the pinned NuGet package on the member's Mac
-  and check both SHA-256 values. The second way is a change of rule: today an
-  installed MacSW downloads nothing. Both ways change
-  `PrerequisiteService.prepareManagedCOMDependencies` and `package_app.sh`, and
-  need a test install.
 - **Source of the LGPL libraries in `Resources/Wine/lib`.** The Gcenx runtime
   takes GnuTLS, Nettle, GMP, libtasn1, libunistring, libidn2, libiconv and
   gettext (libintl) from MacPorts, and its recipe does not pin their versions.

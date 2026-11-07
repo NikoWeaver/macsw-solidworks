@@ -1,6 +1,6 @@
 # Third-party notices
 
-MacSW.app 0.2.0-rc.2 (build 6) contains the software listed below. Each part keeps
+MacSW.app 0.2.0 (build 7) contains the software listed below. Each part keeps
 its own licence and copyright notices. This list comes from `config/third-party-notices.tsv`.
 The full notices, with every licence text, are in `THIRD_PARTY_NOTICES.txt`: in each built app
 (`Contents/Resources`) and in the `Licenses` folder of the DMG. `scripts/third_party_notices.py`
@@ -11,12 +11,13 @@ and of MacSW itself.
 SOLIDWORKS is a registered trademark of Dassault Systemes SolidWorks Corporation. This app is not made, endorsed or supported by Dassault Systemes. It contains no SOLIDWORKS program files; you install SOLIDWORKS from your own licensed media.
 
 This source tree also holds the Wine patches in `patches/wine-crossover` (LGPL-2.1-or-later, see
-`patches/wine-crossover/LICENSE`) and the libinotify-kqueue headers in `third_party/libinotify-kqueue`
-(MIT, see its `LICENSE`).
+`patches/wine-crossover/LICENSE`), the libinotify-kqueue headers in `third_party/libinotify-kqueue`
+(MIT, see its `LICENSE`) and the clean-room stdole in `third_party/stdole-clean` (LGPL-2.1-or-later,
+see its `README.md`).
 
 | # | Component | Version | Licence | In MacSW.app |
 |---|---|---|---|---|
-| 1 | MacSW (fork of YJBeetle/MacSW) | 0.2.0 (build 6) | Apache-2.0 | `Contents/MacOS/MacSW`<br>`Contents/Resources/SOLIDWORKS.app.zip`<br>`Contents/Resources/SOLIDWORKS.app.plist`<br>`Contents/Resources/helpers/msi_spatialiop.exe` |
+| 1 | MacSW (fork of YJBeetle/MacSW) | 0.2.0 (build 7) | Apache-2.0 | `Contents/MacOS/MacSW`<br>`Contents/Resources/SOLIDWORKS.app.zip`<br>`Contents/Resources/SOLIDWORKS.app.plist`<br>`Contents/Resources/helpers/msi_spatialiop.exe` |
 | 2 | Wine | 11.16 | LGPL-2.1-or-later | `Contents/Resources/Wine/bin/*`<br>`Contents/Resources/Wine/lib/wine`<br>`Contents/Resources/Wine/share/wine/fonts`<br>`Contents/Resources/Wine/share/wine/nls`<br>`Contents/Resources/Wine/share/wine/wine.inf`<br>`Contents/Resources/Wine/share/wine/winmd` |
 | 3 | GnuTLS | 3.8.7 (libgnutls.30) | LGPL-2.1-or-later | `Contents/Resources/Wine/lib/libgnutls*` |
 | 4 | Nettle | 3.10 (libnettle.8.9, libhogweed.6.9) | LGPL-3.0-or-later OR GPL-2.0-or-later (used under LGPL-3.0-or-later) | `Contents/Resources/Wine/lib/libnettle*`<br>`Contents/Resources/Wine/lib/libhogweed*` |
@@ -48,7 +49,7 @@ This source tree also holds the Wine patches in `patches/wine-crossover` (LGPL-2
 | 30 | Wine Gecko | 2.47.4 | MPL-2.0 and others | `Contents/Resources/Wine/share/wine/gecko` |
 | 31 | Wine Mono | 11.3.0, with wine-mono-11.3.0-X86StdcallFix-ComRegistration-CCWFix | MIT, LGPL-2.0 and others (see the files below) | `Contents/Resources/Wine/share/wine/mono` |
 | 32 | 7-Zip | 23.01 | LGPL-2.1-or-later, BSD-3-Clause, and LGPL-2.1-or-later with the unRAR restriction | `Contents/MacOS/7zz`<br>`Contents/MacOS/7z` |
-| 33 | stdole | 7.0.3300 | Microsoft licence (http://go.microsoft.com/fwlink/?LinkID=746386) | `Contents/Resources/managed/stdole.dll` |
+| 33 | stdole (clean-room build) | 7.0.3300 | LGPL-2.1-or-later | `Contents/Resources/managed/stdole.dll` |
 | 34 | Python (native, python-build-standalone) | 3.11.16, release 20260901 | PSF-2.0, and the licences of the libraries it includes | `Contents/Resources/SWCLI/runtime/PythonNative` |
 
 ## Sources and notes
@@ -85,5 +86,5 @@ This source tree also holds the Wine patches in `patches/wine-crossover` (LGPL-2
 30. **Wine Gecko.** Source: https://dl.winehq.org/wine/wine-gecko/2.47.4/. Text of about:license from Gecko's omni.ja: the MPL 2.0 and the notices of the code Gecko includes.
 31. **Wine Mono.** Source: https://github.com/wine-mono/wine-mono; see licenses/Mono/SOURCE.txt. MacSW replaces five files with patched builds (libmono-2.0-x86.dll, libmono-2.0-x86_64.dll, mscorlib.dll and the two regasm.exe in Resources/Wine/lib/wine).
 32. **7-Zip.** Source: https://www.7-zip.org (source: https://www.7-zip.org/a/7z2301-src.tar.xz). 7zz is the unchanged macOS console build from 7-zip.org; 7z is a link to it.
-33. **stdole.** Source: https://www.nuget.org/packages/stdole/7.0.3300. © Microsoft Corporation. All rights reserved. Taken unchanged from the NuGet package (SHA-256 4650fd3efc38255954558bd22f2e28f241ff1c27f068687b45fc95b72c9c9de4); the licence address is from the package's stdole.nuspec. That address now leads to Microsoft's pre-release licence terms for Visual Studio 2017, which allow evaluation use only and no distribution.
+33. **stdole (clean-room build).** Source: `third_party/stdole-clean` in this tree (`stdole.cs`, built as its `README.md` says). MacSW's own build (SHA-256 e5d0ce39bfc7620ace151778527ebefeb92a255678c83ff6cc3cb8f550f1bac9), not Microsoft's file: C# declarations of the OLE Automation type library that follow Wine's stdole2.idl (Copyright (C) 2003 Robert Shearman, 2005 Huw Davies) and olectl.h. Licence text: Wine's COPYING.LIB.
 34. **Python (native, python-build-standalone).** Source: https://github.com/astral-sh/python-build-standalone. Runs MacSW's bottle tools (wine_runtime.py). pip's own licence files stay in the runtime (lib/python3.11/site-packages/pip-*.dist-info/licenses).

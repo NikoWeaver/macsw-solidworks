@@ -10,7 +10,7 @@ It looks for personal data (home folders, e-mail addresses, the owner's name, th
 name, Box account folders, MAC addresses, the edition words of a student or academic licence, as
 in a SOLIDWORKS window title), serial-shaped strings, the words of the upstream CI
 that bypassed licensing (removed in this fork), proprietary file types (SOLIDWORKS documents and macros, interop DLLs,
-installer packages, licence files, an icon taken from SLDWORKS.exe, Microsoft's stdole.dll) and
+installer packages, licence files, an icon taken from SLDWORKS.exe, a stdole.dll that is not MacSW's clean-room build) and
 secrets (private keys, tokens).
 
 It prints counts and paths only, never a matched value. Exit status: 0 when nothing is found,
@@ -20,8 +20,8 @@ A folder scan reads every file below the folder except `.git`. Files with a NUL 
 first 8 KiB are binary: their names are checked, and their bytes for home folders only (as
 `--home-paths` does). A file list has one path per line, as `--list-volume` writes it: paths
 relative to the volume, entries of a `.zip` archive as `<archive>.zip:<entry>`, and a tab and
-`sha256=<hex>` after each `.icns` file. A file list has names only, so for a DMG also run
-`--home-paths` on the mounted volume.
+`sha256=<hex>` after each `.icns` and `stdole.dll` file. A file list has names only, so for a DMG
+also run `--home-paths` on the mounted volume.
 
 `--home-paths` reads the bytes of every file below a folder, and of every entry of each zip
 archive in it (`.zip`, `.whl`, `.jar`, `.xpi`, `.ja`, `.nupkg`), and counts home folders of real
@@ -154,8 +154,11 @@ PROPRIETARY_NAME = re.compile(
     r"(?i)(\.sld[a-z]*|\.swp|\.swb|\.msi|\.msp|\.cab|\.lic|\.tsf)$"
     r"|(^|[/:])(?:solidworks|sldworks)[^/]*\.(?:dll|exe)$"
     r"|(^|[/:.])interop\.[^/]*\.dll$"  # SolidWorks.Interop.*.dll, Interop.*.dll; not InteropServices.dll
-    r"|(^|[/:])stdole\.dll$"  # Microsoft's; its licence terms allow no distribution (not Wine's stdole2.tlb)
 )
+# Microsoft's stdole.dll: its licence terms allow no distribution (not Wine's stdole2.tlb). Allowed only
+# with the SHA-256 of MacSW's clean-room build (third_party/stdole-clean, STDOLE_DLL_SHA256).
+STDOLE_NAME = re.compile(r"(?i)(^|[/:])stdole\.dll$")
+CLEAN_STDOLE_SHA256 = "e5d0ce39bfc7620ace151778527ebefeb92a255678c83ff6cc3cb8f550f1bac9"
 WINE_MONO_INSTALLER = re.compile(r"(?i)(^|/)share/wine/mono/(?:[^/]+/)*winemono-[^/]*\.(?:msi|cab)$")
 SECRET_NAME = re.compile(r"(?i)(\.p12|\.pfx|\.keychain|\.keychain-db|\.mobileprovision)$|(^|/)id_(rsa|ecdsa|ed25519)$")
 SOLIDWORKS_BUNDLE = re.compile(r"(?i)(solidworks\.app[/:]|sldworks)")
@@ -348,6 +351,11 @@ def scan_name(name):
     return found
 
 
+def foreign_stdole(name, digest):
+    """A stdole.dll that is not MacSW's clean-room build (no digest: not known, so a hit)."""
+    return bool(STDOLE_NAME.search(name)) and digest != CLEAN_STDOLE_SHA256
+
+
 def icns_from_solidworks(name, digest, own_icons):
     """An .icns of SOLIDWORKS.app (or named after SLDWORKS) that is not MacSW's own icon."""
     if not name.lower().endswith(".icns") or not SOLIDWORKS_BUNDLE.search(name):
@@ -375,6 +383,10 @@ def scan_folder(root, terms):
         found.update(scan_text(relative, relative, terms))
         if icns_from_solidworks(relative, icons.get(relative), own_icons):
             found["proprietary-file"] += 1
+        if STDOLE_NAME.search(relative):
+            digest = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() and not path.is_symlink() else None
+            if foreign_stdole(relative, digest):
+                found["proprietary-file"] += 1
         if path.is_file() and not path.is_symlink():
             data = path.read_bytes()
             if b"\0" in data[:8192]:
@@ -406,6 +418,8 @@ def scan_file_list(entries, terms):
         found.update(scan_text(name, name, terms))
         if icns_from_solidworks(name, digest, own_icons):
             found["proprietary-file"] += 1
+        if foreign_stdole(name, digest):
+            found["proprietary-file"] += 1
         if found:
             results[f"line {number}"] = found
     return results, len(entries)
@@ -423,7 +437,7 @@ def list_volume(volume, out):
                 out.write(relative + "/\n")
                 continue
             extra = ""
-            if name.lower().endswith(".icns") and path.is_file():
+            if (name.lower().endswith(".icns") or STDOLE_NAME.search(name)) and path.is_file():
                 extra = "\tsha256=" + hashlib.sha256(path.read_bytes()).hexdigest()
             out.write(relative + extra + "\n")
             if name.lower().endswith(".zip") and path.is_file() and not path.is_symlink():
@@ -432,7 +446,7 @@ def list_volume(volume, out):
                         if info.filename.startswith("__MACOSX/"):
                             continue
                         entry = f"{relative}:{info.filename}"
-                        if info.filename.lower().endswith(".icns"):
+                        if info.filename.lower().endswith(".icns") or STDOLE_NAME.search(info.filename):
                             entry += "\tsha256=" + hashlib.sha256(archive.read(info)).hexdigest()
                         out.write(entry + "\n")
 

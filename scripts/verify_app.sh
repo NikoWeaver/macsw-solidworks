@@ -363,7 +363,6 @@ for license_file in LICENSE COPYING.LIB PATENTS.TXT; do
 done
 file "${MONO_CCW_DLL}" | grep -q 'PE32+ executable.*x86-64'
 test "$(/usr/libexec/PlistBuddy -c 'Print :StdoleVersion' "${BUILD_MANIFEST}")" = "${STDOLE_VERSION}"
-test "$(/usr/libexec/PlistBuddy -c 'Print :StdolePackageSHA256' "${BUILD_MANIFEST}")" = "${STDOLE_PACKAGE_SHA256}"
 test "$(/usr/libexec/PlistBuddy -c 'Print :StdoleDLLSHA256' "${BUILD_MANIFEST}")" = "${STDOLE_DLL_SHA256}"
 test -L "${RUNTIME_DIR}"
 test "$(readlink "${RUNTIME_DIR}")" = "../Resources/Wine"

@@ -333,6 +333,51 @@ class IconTests(unittest.TestCase):
             self.assertEqual(counts(root), {"proprietary-file": 1})
 
 
+class StdoleTests(unittest.TestCase):
+    """Only MacSW's clean-room stdole.dll (third_party/stdole-clean) passes; any other stdole.dll fails."""
+    CLEAN = (PROJECT / "third_party/stdole-clean/std" "ole.dll").read_bytes()
+    NAME = "MacSW.app/Contents/Resources/managed/std" + "ole.dll"
+
+    def test_the_clean_hash_is_the_build_value(self):
+        self.assertEqual(hashlib.sha256(self.CLEAN).hexdigest(), SCAN.CLEAN_STDOLE_SHA256)
+        versions = (PROJECT / "config/versions.env").read_text()
+        self.assertIn(f'STDOLE_DLL_SHA256="{SCAN.CLEAN_STDOLE_SHA256}"', versions)
+
+    def test_folder_scan(self):
+        with Tree({self.NAME: self.CLEAN, "third_party/stdole-clean/std" "ole.dll": self.CLEAN}) as root:
+            self.assertEqual(counts(root), {})
+        with Tree({self.NAME: b"MZ\0\0 another stdole\0"}) as root:
+            self.assertEqual(counts(root), {"proprietary-file": 1})
+
+    def test_file_list_and_list_volume(self):
+        clean = hashlib.sha256(self.CLEAN).hexdigest()
+        with tempfile.TemporaryDirectory() as folder:
+            listing = Path(folder, "list.txt")
+            listing.write_text(f"{self.NAME}\tsha256={clean}\n")
+            self.assertEqual(run("--file-list", listing)[0], 0)
+            listing.write_text(f"{self.NAME}\tsha256={'c' * 64}\n")
+            self.assertEqual(run("--file-list", listing)[0], 1)
+            listing.write_text(self.NAME + "\n")
+            self.assertEqual(run("--file-list", listing)[0], 1)
+            for content, expected in ((self.CLEAN, 0), (b"MZ\0\0 another\0", 1)):
+                with self.subTest(clean=expected == 0):
+                    volume = Path(folder, f"vol{expected}")
+                    target = volume / self.NAME
+                    target.parent.mkdir(parents=True)
+                    target.write_bytes(content)
+                    with zipfile.ZipFile(volume / "MacSW.app/Contents/Resources/x.zip", "w") as archive:
+                        archive.writestr("managed/std" "ole.dll", content)
+                    out = io.StringIO()
+                    with redirect_stdout(out):
+                        self.assertEqual(SCAN.main(["--list-volume", str(volume)]), 0)
+                    self.assertIn("x.zip:managed/std" "ole.dll\tsha256=", out.getvalue())
+                    listing.write_text(out.getvalue())
+                    code, output = run("--file-list", listing)
+                    self.assertEqual(code, expected, output)
+                    if expected:
+                        self.assertIn("result: FAIL (2 hit(s)", output)
+
+
 class FileListTests(unittest.TestCase):
     def test_file_list(self):
         own, other = "a" * 64, "b" * 64

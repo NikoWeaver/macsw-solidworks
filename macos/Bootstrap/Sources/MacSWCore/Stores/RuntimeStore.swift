@@ -63,6 +63,11 @@ public final class RuntimeStore: ObservableObject {
         }
     }
 
+    /// Waits for a running `maintainWineRuntime` to finish; returns at once when none runs.
+    public func waitForWineMaintenance() async {
+        await wineMigrationTask?.value
+    }
+
     public let paths: AppPaths
     private let wine: WineService
     private let licenseServer: LicenseServerStore

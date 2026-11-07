@@ -75,6 +75,9 @@ The patches of this fork, by file name:
   `MACSW_HOST_APP` to the Wine host when they are set, so a Finder open on a
   test instance stays in its own bottle; MacSW passes `MACSW_GL_MPENGINE` to
   Wine.
+- New in 0.2.0: an alert at launch and on a Dock click when the bottle's Wine
+  record blocks SOLIDWORKS, with Back Up and Upgrade Bottle for a pending
+  upgrade (`WineRuntimeLaunchPrompt`, `RuntimeStore.waitForWineMaintenance`).
 
 ## Build and packaging
 
@@ -97,6 +100,11 @@ The patches of this fork, by file name:
   less; `MACSW_STRIP_PE=0` keeps the symbols), and `verify_app.sh` checks them.
   `scripts/macho_func_cmp.py` compares the functions of two builds of a Mach-O
   module.
+- New in 0.2.0: `third_party/stdole-clean`, a clean-room `stdole.dll`
+  (LGPL-2.1-or-later, from Wine's `stdole2.idl`). It replaces Microsoft's file
+  from the NuGet package stdole, which upstream downloads at build time and
+  whose licence terms allow no distribution. `make fetch-stdole` now only checks
+  the SHA-256 of the file in the tree.
 - New for publication: `scripts/ci/publication_scan.py`,
   `scripts/make_public_tree.sh`, `scripts/ci/public-tree-remove.txt` and
   `.github/workflows/publication-scan.yml`.

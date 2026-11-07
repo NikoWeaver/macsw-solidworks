@@ -65,7 +65,7 @@ sldappu.dll
 
 ## App 集成
 
-- Builder 从微软官方 NuGet 包下载并校验 `stdole 7.0.3300`，并下载匹配的 Wine-Mono
+- Builder 校验仓库内的 clean-room `stdole 7.0.3300`（`third_party/stdole-clean`），并下载匹配的 Wine-Mono
   `mscorlib.dll` 与 x86/x64 托管 RegAsm。App 在安装前校验整套运行时，把依赖放到
   `SOLIDWORKS Shared`，安装 RegAsm 入口，并静默运行介质中的 Login Manager MSI。
   主 SOLIDWORKS MSI 继续使用官方交互窗口。2026-09-13 使用重新打包的 App 清理旧 bottle

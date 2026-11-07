@@ -92,7 +92,7 @@ daemon 已运行。skill／指南直接引用随包原生 Python 中的完整资
 3. 从配置指定的官方 Wine 源码构建打过补丁的 `winemac.so`、`win32u.so`、
    x64 `combase.dll` 和 loader。
 4. 覆盖已验证的 Wine-Mono x86 修复模块、RegistrationServices mscorlib 和 x86/x64 托管 RegAsm。
-5. 从 Microsoft NuGet 包提取、校验托管 COM 注册使用的 `stdole.dll`。
+5. 校验并放入托管 COM 注册使用的 `stdole.dll`（仓库内 `third_party/stdole-clean` 的 clean-room 构建，LGPL-2.1-or-later；不再下载 Microsoft NuGet 包）。
 6. 打包两种 Python 运行时、SWCLI 和固定依赖，对原生模块临时签名并校验。
 
 `win32u.so` 构建使用 Homebrew Bison 和 FreeType 头文件；运行时通过相对 RPATH

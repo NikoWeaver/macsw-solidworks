@@ -107,6 +107,50 @@ enum DownloadQuarantinePrompt {
     }
 }
 
+/// At MacSW launch or a Dock click: SOLIDWORKS is installed, but the bottle's Wine record blocks the start
+/// (usually a pending upgrade after an App update). MacSW then lives only in the menu bar, so without this
+/// alert nothing visible happens; Settings → Maintenance has the same actions.
+@MainActor
+enum WineRuntimeLaunchPrompt {
+    private static var presenting = false
+
+    static func presentIfBlocked(_ runtime: RuntimeStore) {
+        let state = runtime.wineRuntimeState
+        guard runtime.isInstalled, !state.allowsLaunch, !runtime.isMigratingWine, !presenting else { return }
+        presenting = true
+        defer { presenting = false }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "SOLIDWORKS cannot start yet"
+        alert.informativeText = state.message
+            + " Settings → Maintenance (the cube icon in the menu bar) has the same actions."
+        if state == .upgrade {
+            alert.informativeText += "\n\nSave your documents first. All Windows processes in this bottle will be stopped; the old App and a full bottle backup are kept. Do not quit MacSW while it runs."
+            alert.addButton(withTitle: "Back Up and Upgrade Bottle")
+            alert.addButton(withTitle: "Not Now")
+        } else {
+            alert.addButton(withTitle: "OK")
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn, state == .upgrade else { return }
+        runtime.maintainWineRuntime("upgrade")
+        Task {
+            await runtime.waitForWineMaintenance()
+            let ready = runtime.wineRuntimeState.allowsLaunch
+            let result = NSAlert()
+            result.alertStyle = ready ? .informational : .warning
+            result.messageText = ready ? "The bottle is upgraded" : "The bottle upgrade did not finish"
+            result.informativeText = runtime.statusMessage
+            if ready {
+                result.addButton(withTitle: "Start SOLIDWORKS")
+                result.addButton(withTitle: "Later")
+            }
+            NSApp.activate(ignoringOtherApps: true)
+            if result.runModal() == .alertFirstButtonReturn, ready { runtime.launch() }
+        }
+    }
+}
+
 /// At MacSW launch: SOLIDWORKS is installed but VBA 7.1 is not, so SOLIDWORKS rejects every equation
 /// without saying why. The menu bar panel and Settings → Maintenance keep showing it after this alert.
 @MainActor

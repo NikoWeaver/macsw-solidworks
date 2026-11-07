@@ -86,6 +86,7 @@ struct MacSWApplication: App {
             await runtime.handleDockReopen { pid in
                 NSRunningApplication(processIdentifier: pid)?.activate(options: [.activateAllWindows]) ?? false
             }
+            WineRuntimeLaunchPrompt.presentIfBlocked(runtime)
         }
         let autoLaunch = AppPreferences.autoLaunchSolidWorks()
         AppShell.shared.setLaunchHandler { [weak vba, weak runtime] in
@@ -98,6 +99,7 @@ struct MacSWApplication: App {
             runtime?.prepareFontLinkAtAppLaunch()
             Task { @MainActor in
                 await runtime?.startup(autoLaunch: autoLaunch)
+                if let runtime { WineRuntimeLaunchPrompt.presentIfBlocked(runtime) }
             }
             // Launch-time VBA check (registry files only, no Wine process); warns when equations and macros will not work.
             guard let vba else { return }

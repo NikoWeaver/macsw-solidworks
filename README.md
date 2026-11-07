@@ -18,7 +18,7 @@ activates through Dassault's own Activation Wizard, or uses a real SolidNetWork 
 
 ## Status
 
-- Release candidate **0.2.0-rc.2** for **SOLIDWORKS 2026 SP4.1** (34.4.1.1011). Other service packs
+- Release **0.2.0** for **SOLIDWORKS 2026 SP4.1** (34.4.1.1011). Other service packs
   may not install.
 - Works: install, activation, parts, assemblies, drawings, STEP and STL export and import, equations
   and macros (with VBA 7.1), opening files from Finder, the Mac file panel for Open and Save.
